@@ -12,13 +12,14 @@ const { join } = require('node:path');
 const { existsSync } = require('node:fs');
 const { readFile, writeFile } = require('node:fs/promises');
 const { EventEmitter } = require('node:events');
+
 const { Client, Server } = require('@yipsec/scarf');
 const { Identity, Message } = require('@yipsec/rise');
 const { TorContext } = require('@yipsec/bulb');
 const { ScalingBloomFilter } = require('@yipsec/blossom').bloom;
 const { Node, Contact, constants } = require('@yipsec/kdns');
 const { consensus, events, log } = require('@yipsec/brig');
-const { DAG } = require('@yipsec/merked').dag;
+const { dag, tree } = require('@yipsec/merked');
 const { Storage } = require('./lib/storage');
 
 
@@ -262,7 +263,7 @@ class Presence extends EventEmitter {
         // Check there is a log file at the given path.
         const logState = storage.has(clusterKey)
           // Load it from disk.
-          ? log.LogState.deserialize((await storage.get(clusterKey)).value)
+          ? log.LogState.deserialize((await storage.get(clusterKey)).blob)
           // Otherwise just create a new one.
           : new log.LogState();
 
@@ -354,9 +355,11 @@ class Presence extends EventEmitter {
       // When an entry is commited is a time to do it.
       cluster.on(events.LogCommit, async (logEntry) => {
         await this.storage.put(`.CLUSTER_${cluster.id}`, {
-          value: cluster.log.serialize().toString('hex'),
-          timestamp: Date.now(),
-          publisher: this.identity.fingerprint.toString('hex')
+          blob: cluster.log.serialize().toString('hex'),
+          meta: {
+            timestamp: Date.now(),
+            publisher: this.identity.fingerprint.toString('hex')
+          }
         });
       });
 
@@ -424,6 +427,63 @@ class Presence extends EventEmitter {
           return resolve(result);
         });
       }        
+    });
+  }
+
+  /**
+   * Creates a merkle graph from the provided buffer and iteratively store 
+   * each leaf in the DHT.
+   *
+   * @param {buffer} buffer - Raw buffer to store.
+   * @param {string} [aliasName] - Filename or alias name for the data.
+   * @returns {Promise.<DagMetadata>}
+   */
+  writeGraph(buffer, aliasName) {
+    return new Promise(async (resolve, reject) => {
+      const merkleGraph = dag.DAG.fromBuffer(
+          buffer,
+          4 * 1024, // slice size in bytes
+          tree.MerkleTree.DEFAULT_HASH_FUNC, // hash function to use on inputs
+          false, // pad the last slice to the slice size
+          false // if padLastSlice fill with random bytes?
+      );
+
+      // For every shard in the DAG, store it by its hash.
+      for (let s = 0; s < merkleGraph.shards.length; s++) {
+        try {
+          await this.dht.iterativeStore(merkleGraph.leaves[s], 
+            merkleGraph.shards[s]);
+        } catch (err) {
+          return reject(err);
+        }
+      }
+
+      resolve(merkleGraph.toMetadata(aliasName));
+    });
+  }
+
+  /**
+   * Reconstructs a buffer from the provided graph metadata.
+   *
+   * @param {DagMetadata} graphMeta - JSON serialized DAG metadata.
+   * @returns {Promise.<buffer>}
+   */
+  readGraph(graphMeta) {
+    return new Promise(async (resolve, reject) => {
+      try {
+        // Collect the results of parallel blob lookups and concatenate them.
+        resolve(Buffer.concat(await Promise.all(graphMeta.l.map(leaf => {
+          return new Promise(async (resolve, reject) => {
+            try {
+              resolve(await this.dht.iterativeFindValue(leaf));
+            } catch (err) {
+              return reject(err);
+            }
+          });
+        }))));
+      } catch (err) {
+        return reject(err);
+      }
     });
   }
 
