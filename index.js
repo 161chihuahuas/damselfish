@@ -31,10 +31,10 @@ class Config {
 
   static createDefaults(datadir) {
     return {
-      database: join(datadir, 'db.dat'),
-      identity: join(datadir, 'id.sec'),
-      clusters: join(datadir, 'clusters.manifest'),
-      onionkey: join(datadir, 'onion.key')
+      DataDirectory: join(datadir, 'db.dat'),
+      IdentityKeyPath: join(datadir, 'id.sec'),
+      ClustersManifest: join(datadir, 'clusters.manifest'),
+      OnionKeyPath: join(datadir, 'onion.key')
     };
   }
 
@@ -47,10 +47,10 @@ class Config {
   constructor(dataDirectory = Config.DataDirectory) {
     const DEFAULTS = Config.createDefaults(dataDirectory);
 
-    this.database = DEFAULTS.database;
-    this.identity = DEFAULTS.identity;
-    this.clusters = DEFAULTS.clusters;
-    this.onionkey = DEFAULTS.onionkey;
+    this.DataDirectory = DEFAULTS.DataDirectory
+    this.IdentityKeyPath = DEFAULTS.IdentityKeyPath;
+    this.ClustersManifest = DEFAULTS.ClustersManifest;
+    this.OnionKeyPath = DEFAULTS.OnionKeyPath;
   }
 
 }
@@ -60,8 +60,12 @@ module.exports.Config = Config;
 
 class Presence extends EventEmitter {
 
-  static get Ready() {
-    return Symbol('damselfish~Presence#ready');
+  static get Events() {
+    return {
+      Ready: Symbol('damselfish~Presence~Events#Ready'),
+      TimelineUpdated: Symbol('damselfish~Presence~Events#TimelineUpdated'),
+      DebugInfo: Symbol('damselfish~Presence~Events#DebugInfo')
+    };
   }
 
   /**
@@ -142,19 +146,20 @@ class Presence extends EventEmitter {
 
     return new Promise(async (resolve, reject) => {
       // Get an instance of where we are going to store DHT records locally.
-      const storage = new Storage(config.database);
+      const storage = new Storage(config.DataDirectory);
       
       let identity, tor, address;
 
       try {
         identity = existsSync(config.identity)
           // If there is a file at the config.identity path, try to unlock it.
-          ? await Identity.unlock(password, await readFile(config.identity))
+          ? await Identity.unlock(password, 
+            await readFile(config.IdentityKeyPath))
           // Otherwise, generate a new identity
           : await Identity.generate(6, 90, 5);
         
         // Save the generated identity encrypted to disk.
-        await writeFile(config.identity, identity.lock(password))
+        await writeFile(config.IdentityKeyPath, identity.lock(password))
 
         // Bootstrap a Tor context before doing anything else!
         tor = await TorContext.create();
@@ -213,8 +218,8 @@ class Presence extends EventEmitter {
       try {
         // If we have already created an onion service before, load the 
         // encrypted private key, decrypt it.
-        let onion = existsSync(config.onionkey)
-          ? Message.fromBuffer(await readFile(config.onionkey))
+        let onion = existsSync(config.OnionKeyPath)
+          ? Message.fromBuffer(await readFile(config.OnionKeyPathnkey))
               .decrypt(identity.secret.privateKey)
               .unwrap()
           // Otherwise we will create one...
@@ -233,7 +238,7 @@ class Presence extends EventEmitter {
         }).toBuffer();
         
         // Write the encrypted private key to disk.
-        await writeFile(config.onionkey, onion);
+        await writeFile(config.OnionKeyPath, onion);
       } catch (e) {
         return reject(e);
       }
@@ -243,8 +248,8 @@ class Presence extends EventEmitter {
       contact.address.host = address.host;
       contact.address.port = address.port;
 
-      const clustersManifest = existsSync(config.clusters)
-        ? Message.fromBuffer(await readFile(config.clusters))
+      const clustersManifest = existsSync(config.ClustersManifest)
+        ? Message.fromBuffer(await readFile(config.ClustersManifest))
           .decrypt(identity.secret.privateKey)
           .unwrap()
         : [];
@@ -353,7 +358,7 @@ class Presence extends EventEmitter {
 
       // We need to persist each cluster's log state to disk periodically.
       // When an entry is commited is a time to do it.
-      cluster.on(events.LogCommit, async (logEntry) => {
+      cluster.on(events.LogCommit, async (_logEntry) => {
         await this.storage.put(`.CLUSTER_${cluster.id}`, {
           blob: cluster.log.serialize().toString('hex'),
           meta: {
@@ -361,6 +366,7 @@ class Presence extends EventEmitter {
             publisher: this.identity.fingerprint.toString('hex')
           }
         });
+        this.emit(Presence.Events.TimelineUpdated, cluster.id, _logEntry);
       });
 
       // Get the protocol handlers for out cluster log replication.
@@ -374,7 +380,7 @@ class Presence extends EventEmitter {
     }
     
     // Presence is ready and online.
-    this.emit(Presence.Ready);
+    this.emit(Presence.Events.Ready);
   }
 
 
@@ -466,25 +472,86 @@ class Presence extends EventEmitter {
    * Reconstructs a buffer from the provided graph metadata.
    *
    * @param {DagMetadata} graphMeta - JSON serialized DAG metadata.
-   * @returns {Promise.<buffer>}
+   * @returns {Promise.<external:DAG>}
    */
   readGraph(graphMeta) {
     return new Promise(async (resolve, reject) => {
       try {
         // Collect the results of parallel blob lookups and concatenate them.
-        resolve(Buffer.concat(await Promise.all(graphMeta.l.map(leaf => {
-          return new Promise(async (resolve, reject) => {
-            try {
-              resolve(await this.dht.iterativeFindValue(leaf));
-            } catch (err) {
-              return reject(err);
-            }
-          });
-        }))));
+        resolve(dag.DAG.fromBuffer(Buffer.concat(
+          await Promise.all(graphMeta.l.map(leaf => {
+            return new Promise(async (resolve, reject) => {
+              try {
+                resolve(await this.dht.iterativeFindValue(leaf));
+              } catch (err) {
+                return reject(err);
+              }
+            });
+          }))
+        )));
       } catch (err) {
         return reject(err);
       }
     });
+  }
+
+  /**
+   * Creates and negotiates a new cluster. A cluster is a shared log containing 
+   * commands that rebuild a shared media timeline state machine. This 
+   * abstraction may be surfaced as a personal journal, a public blog, a group 
+   * chat, a virtual filesystem, etc etc.
+   *
+   * 
+   */
+  createCluster() {
+    // TODO
+  }
+
+  /**
+   * Destroys a cluster. Removes all local traces of the shared timeline.
+   *
+   *
+   */
+  destroyCluster() {
+    // TODO
+  }
+
+  /**
+   *
+   *
+   * @private
+   */
+  _handleClusterRequest() {
+    // TODO
+  }
+
+  /**
+   * Replays the cluster log associated with the given identifier.
+   *
+   * @param {string} clusterId - The unique UUID v4 assigned to the cluster.
+   * @returns {external:Readable.<external:LogEntry>} 
+   */
+  createTimelineReplay(clusterId) {
+    // TODO
+  }
+
+  /**
+   * Appends the command payload to the log of the specified cluster.
+   *
+   *
+   */
+  appendToTimeline(clusterId, command) {
+    // TODO
+  }
+
+  /**
+   * Links a local or remote client with this presence, exposing an API for 
+   * userland applications to integrate with damselfish.
+   *
+   * 
+   */
+  linkControllerClient() {
+    // TODO
   }
 
 }
