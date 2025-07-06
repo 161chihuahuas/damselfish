@@ -12,6 +12,7 @@ const { join } = require('node:path');
 const { existsSync } = require('node:fs');
 const { readFile, writeFile } = require('node:fs/promises');
 const { EventEmitter } = require('node:events');
+const { Readable } = require('node:stream');
 
 const { Client, Server } = require('@yipsec/scarf');
 const { Identity, Message } = require('@yipsec/rise');
@@ -21,6 +22,7 @@ const { Node, Contact, constants } = require('@yipsec/kdns');
 const { consensus, events, log } = require('@yipsec/brig');
 const { dag, tree } = require('@yipsec/merked');
 const { Storage } = require('./lib/storage');
+const { Readable } = require('node:stream');
 
 
 class Config {
@@ -129,7 +131,11 @@ class Presence extends EventEmitter {
     this.contact = options.contact;
     this.server = options.server;
     this.dht = options.dht;
-    this.clusters = options.clusters;
+    this.clusters = new Map();
+
+    for (let c = 0; c < options.clusters.length; c++) {
+      this.clusters.set(options.clusters[c].id, options.clusters[c]);
+    }
 
     this._bootstrap();
   }
@@ -339,9 +345,7 @@ class Presence extends EventEmitter {
     });
 
     // Bootstrap all of our clusters.
-    for (let c = 0; c < this.clusters.length; c++) {
-      const cluster = this.clusters[c];
-
+    for (let cluster of this.clusters.values()) {
       // We need to link up the transport to each peer object in the cluster.
       for (let p = 0; p < cluster.peers.length; p++) {
         const peer = cluster.peers[p];
@@ -521,7 +525,16 @@ class Presence extends EventEmitter {
    *
    * @private
    */
-  _handleClusterRequest() {
+  _handleCreateCluster() {
+    // TODO
+  }
+
+  /**
+   *
+   *
+   * @private
+   */
+  _handleDestroyCluster() {
     // TODO
   }
 
@@ -531,8 +544,18 @@ class Presence extends EventEmitter {
    * @param {string} clusterId - The unique UUID v4 assigned to the cluster.
    * @returns {external:Readable.<external:LogEntry>} 
    */
-  createTimelineReplay(clusterId) {
-    // TODO
+  readFromTimeline(clusterId) {
+    const { log } = this.clusters.get(clusterId).state;
+    
+    let entryIndex = 0;
+
+    const rStream = new Readable({
+      read() {
+        this.push(log[entryIndex++] || null);
+      }
+    });
+
+    return rStream;
   }
 
   /**
@@ -540,8 +563,8 @@ class Presence extends EventEmitter {
    *
    *
    */
-  appendToTimeline(clusterId, command) {
-    // TODO
+  writeToTimeline(clusterId, bubble) {
+    return this.clusters.get(clusterId).broadcast(bubble.toJSON());
   }
 
   /**
@@ -554,6 +577,40 @@ class Presence extends EventEmitter {
     // TODO
   }
 
+  /**
+   * Unlinks a local or remote client from this presence. 
+   *
+   * 
+   */
+  unlinkControllerClient() {
+    // TODO
+  }
+
 }
 
 module.exports.Presence = Presence;
+
+
+class Bubble {
+
+  /**
+   *
+   *
+   * @constructor
+   *
+   */
+  constructor() {
+    // TODO
+  }
+
+  /**
+   *
+   *
+   */
+  toJSON() {
+    // TODO
+  }
+
+}
+
+module.exports.Bubble = Bubble;

@@ -4,7 +4,8 @@
     "email": "161chihuahuas@disroot.org"
   },
   "bin": {
-    "damselfish": "bin/damselfish.js"
+    "fishd": "bin/fishd.js",
+    "fin": "bin/fin.js"
   },
   "bugs": {
     "url": "https://github.com/161chihuahuas/damselfish/issues"
