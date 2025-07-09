@@ -23,6 +23,7 @@ const { consensus, events, log } = require('@yipsec/brig');
 const { dag, tree } = require('@yipsec/merked');
 const { Storage } = require('./lib/storage');
 const { Readable } = require('node:stream');
+const { randomBytes } = require('node:crypto');
 
 
 class Config {
@@ -33,14 +34,16 @@ class Config {
 
   static createDefaults(datadir) {
     return {
-      DataDirectory: join(datadir, 'db.dat'),
-      IdentityKeyPath: join(datadir, 'id.sec'),
-      ClustersManifest: join(datadir, 'clusters.manifest'),
-      OnionKeyPath: join(datadir, 'onion.key')
+      DataDirectory: join(datadir, 'database.encrypted'),
+      IdentityKeyPath: join(datadir, 'private_key.encrypted'),
+      ClustersManifest: join(datadir, 'clusters_manifest.encrypted'),
+      OnionKeyPath: join(datadir, 'address_key.encrypted'),
+      LinkedClients: join(datadir, 'linked_clients.encrypted'),
+      RoutingTable: join(datadir, 'routing_table.encrypted')
     };
   }
 
-  /**
+/**
    *
    *
    * @constructor
@@ -53,6 +56,8 @@ class Config {
     this.IdentityKeyPath = DEFAULTS.IdentityKeyPath;
     this.ClustersManifest = DEFAULTS.ClustersManifest;
     this.OnionKeyPath = DEFAULTS.OnionKeyPath;
+    this.LinkedClients = DEFAULTS.LinkedClients;
+    this.RoutingTable = DEFAULTS.RoutingTable;
   }
 
 }
@@ -65,6 +70,8 @@ class Presence extends EventEmitter {
   static get Events() {
     return {
       Ready: Symbol('damselfish~Presence~Events#Ready'),
+      ClientRegistered: Symbol('damselfish~Presence~Events#ClientRegistered'),
+      ClientUnregistered: Symbol('damselfish~Presence~Events#ClientUnregistered'),
       TimelineUpdated: Symbol('damselfish~Presence~Events#TimelineUpdated'),
       DebugInfo: Symbol('damselfish~Presence~Events#DebugInfo')
     };
@@ -102,6 +109,7 @@ class Presence extends EventEmitter {
    * @property {external:Node} dht - Kademlia DHT implementation.
    * @property {external:Contact} contact - KDNS contact instance.
    * @property {external:Cluster[]} clusters - Array of Raft clusters.
+   * @property {string[]} clients - Public keys of linked clients.
    */
 
   /**
@@ -132,10 +140,13 @@ class Presence extends EventEmitter {
     this.server = options.server;
     this.dht = options.dht;
     this.clusters = new Map();
+    this.clients = new Set(options.clients);
 
     for (let c = 0; c < options.clusters.length; c++) {
       this.clusters.set(options.clusters[c].id, options.clusters[c]);
     }
+
+    this._controlServers = new Map();
 
     this._bootstrap();
   }
@@ -188,6 +199,50 @@ class Presence extends EventEmitter {
 
       // Create a kdns (kademlia-like) Node. This is our interface to the DHT.
       const dht = new Node(contact);
+
+      // If there is a a routing table cached already, populated from it.
+      if (existsSync(config.RoutingTable)) {
+        const cachedContactList = Message.fromBuffer(
+          await readFile(config.RoutingTable)
+        ).decrypt(identity.secret.privateKey).unwrap();
+
+        for (let fingerprint in cachedContactList) {
+          dht.router.addContact(fingerprint, new Contact(
+            cachedContactList[fingerprint],
+            fingerprint
+          ));
+        }
+      }
+
+      // Handle routing table events and persist the table state.
+      dht.router
+        .on('contact_added', _persistRouterState)
+        .on('contact_deleted', _persistRouterState);
+
+      // Function to serialize the router state into an encrypted cache.
+      async function _persistRouterState() {
+        // Fingerprint<>Contact pairs will dump here.
+        let routerDump = {};
+
+        // The router is a set of 160 (B) buckets of up to 20 (K) contacts.
+        const kBuckets = dht.router.values();
+        
+        // Iterate through the buckets and merge the existing dump.
+        for (let b = 0; b < kBuckets.length; b++) {
+          const kBucket = Object.fromEntries(kBuckets[b].entries())
+
+          routerDump = {
+            ...routerDump,
+            ...kBucket
+          };
+        }
+
+        // Write the router dump to an encrypted file.
+        await writeFile(config.RoutingTable, identity.message(
+          identity.secret.publicKey,
+          routerDump
+        ).toBuffer());
+      }
       
       // Define static protocol for handling DHT message types. This
       const protocol = {
@@ -225,7 +280,7 @@ class Presence extends EventEmitter {
         // If we have already created an onion service before, load the 
         // encrypted private key, decrypt it.
         let onion = existsSync(config.OnionKeyPath)
-          ? Message.fromBuffer(await readFile(config.OnionKeyPathnkey))
+          ? Message.fromBuffer(await readFile(config.OnionKeyPath))
               .decrypt(identity.secret.privateKey)
               .unwrap()
           // Otherwise we will create one...
@@ -264,12 +319,12 @@ class Presence extends EventEmitter {
       const clusters = clustersManifest.map(async clusterDef => {
         // The peer list in the configuration is converted into a list of Peer 
         // objects.
-        const peers = clusterDef.peers.map(contact => {
-          return new consensus.Peer(contact.fingerprint);
+        const peers = clusterDef.members.map(fingerprint => {
+          return new consensus.Peer(fingerprint);
         });
         
         // Create a special key to store cluster config locally.
-        const clusterKey = `.CLUSTER_${clusterDef.uuid}`;
+        const clusterKey = `.CLUSTER_${clusterDef.localkey}`;
 
         // Check there is a log file at the given path.
         const logState = storage.has(clusterKey)
@@ -279,11 +334,11 @@ class Presence extends EventEmitter {
           : new log.LogState();
 
         // Create a cluster context.
-        return new consensus.Cluster(clusterDef.uuid, peers, logState);
+        return new consensus.Cluster(clusterDef.localkey, peers, logState);
       });
 
       // We can now establish a Presence on the network.
-      resolve(new Presence({
+      const presence = new Presence({
         storage,
         identity,
         tor,
@@ -291,9 +346,24 @@ class Presence extends EventEmitter {
         server,
         dht,
         clusters
-      }));
+      });
+
+      let linkedClients = existsSync(config.LinkedClients)
+        ? Message.fromBuffer(await readFile(config.LinkedClients))
+            .decrypt(identity.secret.privateKey)
+            .unwrap()
+        : {};
+
+      for (let publicKey in linkedClients) {
+        await presence.linkControllerClient(publicKey, linkedClients[publicKey]);
+      }
+
+      resolve(presence);
     });
   }
+
+  /**
+   * 
 
   /**
    * Setup networking and internal event handlers.
@@ -353,7 +423,7 @@ class Presence extends EventEmitter {
         // Deliver the message to the underlying hidden socket.
         peer.on(events.MessageQueued, (fingerprint, message) => {
           // The cluster ID is the RPC method namespace.
-          const method = `CLUSTER_${cluster.id}/${message.constructor.method}`;
+     const method = `CLUSTER_${cluster.id}/${message.constructor.method}`;
 
           this.send(this.dht.router.getContactById(fingerprint), 
             method, [message]).then(acked => acked, err => err); 
@@ -386,7 +456,6 @@ class Presence extends EventEmitter {
     // Presence is ready and online.
     this.emit(Presence.Events.Ready);
   }
-
 
   /**
    * Send a remote procedure call to the target.
@@ -500,6 +569,27 @@ class Presence extends EventEmitter {
   }
 
   /**
+   * Adds a contact to the routing table and initiates a lookup. Routing table 
+   * is persisted to maintain updated local contact list cache.
+   *
+   * @param {string} contactLink - The node URL referencing another presence.
+   * @returns {Promise.<TODO>}
+   */
+  addContact(contactLink) {
+    // TODO
+  }
+
+  /**
+   * Removes the contact from the routing table.
+   *
+   * @param {string} fingerprint - Node fingerprint to remove.
+   * @returns {Promise.<TODO>}
+   */
+  removeContact(contactFingerprint) {
+    // TODO
+  } 
+
+  /**
    * Creates and negotiates a new cluster. A cluster is a shared log containing 
    * commands that rebuild a shared media timeline state machine. This 
    * abstraction may be surfaced as a personal journal, a public blog, a group 
@@ -521,50 +611,55 @@ class Presence extends EventEmitter {
   }
 
   /**
-   *
-   *
-   * @private
-   */
-  _handleCreateCluster() {
-    // TODO
-  }
-
-  /**
-   *
-   *
-   * @private
-   */
-  _handleDestroyCluster() {
-    // TODO
-  }
-
-  /**
-   * Replays the cluster log associated with the given identifier.
+   * Replays the cluster log associated with the given identifier from the 
+   * readable end.
+   * Appends the command payload to the log of the specified cluster on the 
+   * writable end.
    *
    * @param {string} clusterId - The unique UUID v4 assigned to the cluster.
    * @returns {external:Readable.<external:LogEntry>} 
    */
-  readFromTimeline(clusterId) {
-    const { log } = this.clusters.get(clusterId).state;
+  createDuplexTimeline(clusterId) {
+    const { cluster } = this.clusters.get(clusterId);
+    const { log } = cluster.state;
     
-    let entryIndex = 0;
+    let readIndex = 0;
 
-    const rStream = new Readable({
-      read() {
-        this.push(log[entryIndex++] || null);
-      }
+    function getNextLogEntry() {
+      return new Promise((resolve) => {
+        let entry = log[readIndex++];
+        
+        if (entry) {
+          return resolve(entry);
+        }
+
+        cluster.once(events.LogCommit, resolve);
+      });
+    }
+
+    const dStream = new Duplex({
+      async read() {
+        this.push(await getNextLogEntry());
+      },
+      write(data, _enc, writeDidComplete) {
+        cluster.broadcast(data);
+        writeDidComplete();
+      },
+      objectMode: true
     });
 
-    return rStream;
+    return dStream;
   }
 
   /**
-   * Appends the command payload to the log of the specified cluster.
+   *
    *
    *
    */
-  writeToTimeline(clusterId, bubble) {
-    return this.clusters.get(clusterId).broadcast(bubble.toJSON());
+  createControllerInterface() {
+    return {
+      // TODO
+    };
   }
 
   /**
@@ -573,8 +668,69 @@ class Presence extends EventEmitter {
    *
    * 
    */
-  linkControllerClient() {
-    // TODO
+  linkControllerClient(clientPublicKey, serverOpts) {
+    const controllerApi = this.createControllerInterface();
+    const clientToken = randomBytes(32);
+    const clientChallenge = randomBytes(64);
+
+    const controlServer = new Server({}, () => 
+      this.tor.createServer());
+
+    let didRegister = typeof clientPublicKey === 'string';
+
+    controlServer.api = didRegister
+      ? { challenge, authenticate }
+      : { register };
+
+    const register = async (token, _clientPublicKey, respond) => {
+      if (token === clientToken.toString('hex')) {
+        didRegister = true;
+        controlServer.api.register = null;
+        controlServer.api = { challenge, authenticate };
+
+        this.clients.add(_clientPublicKey);
+        this.emit(Presence.Events.ClientRegistered, {
+          clientPublicKey: _clientPublicKey,
+          clientToken,
+          clientChallenge,
+          serverAddress
+        });
+        respond(null, []);
+      } else {
+        respond(new Error('Unauthorized.'));
+      }
+    }
+
+    const challenge = (respond) => {
+      respond(null, [this.identity.message(clientPublicKey, {
+        challenge: clientChallenge.toString('hex')
+      })]);
+    };
+
+    function authenticate(decryptedChallenge, respond) {
+      if (decryptedChallenge !== clientChallenge.toString('hex')) {
+        return respond(new Error('Unauthorized.'));
+      }
+
+      for (let method in controllerApi) {
+        controlServer.api[method] = controllerApi[method];
+      }
+
+      respond(null, Object.keys(controllerApi));
+    }
+
+    return new Promise(async (resolve, reject) => {
+      let address;
+
+      try {
+        address = await controlServer.server.listen(serverOpts);
+      } catch (e) {
+        return reject(e);
+      }
+
+      this._controlServers.set(clientPublicKey, controlServer);
+      resolve({ address, token: clientToken });
+    });
   }
 
   /**
@@ -582,35 +738,27 @@ class Presence extends EventEmitter {
    *
    * 
    */
-  unlinkControllerClient() {
-    // TODO
+  unlinkControllerClient(clientPublicKey) {
+    const server = this._controlServers.get(clientPublicKey);
+
+    if (!server) {
+      return Promise.reject(new Error('Key not registered.'));
+    }
+
+    return new Promise((resolve, reject) => {
+      try {
+        server.server.close();
+      } catch (e) {
+        return reject(e);
+      }
+
+      this.clients.delete(clientPublicKey);
+      this.emit(Presence.Events.ClientUnregistered, clientPublicKey);
+      
+      resolve();
+    });
   }
 
 }
 
 module.exports.Presence = Presence;
-
-
-class Bubble {
-
-  /**
-   *
-   *
-   * @constructor
-   *
-   */
-  constructor() {
-    // TODO
-  }
-
-  /**
-   *
-   *
-   */
-  toJSON() {
-    // TODO
-  }
-
-}
-
-module.exports.Bubble = Bubble;
