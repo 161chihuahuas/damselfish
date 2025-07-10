@@ -39,7 +39,7 @@
     "url": "git+https://github.com/161chihuahuas/damselfish.git"
   },
   "scripts": {
-    "test": "mocha test --exit",
+    "test": "mocha test.js --exit",
     "docs": "mkdir -p ./docs && rm -r ./docs && jsdoc index.js lib -r -c .jsdoc.json --verbose -d ./docs"
   },
   "version": "1.0.0",

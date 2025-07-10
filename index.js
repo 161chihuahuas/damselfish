@@ -8,8 +8,11 @@
 'use strict';
 
 const { homedir } = require('node:os');
-const { join } = require('node:path');
-const { existsSync } = require('node:fs');
+const { join, extname } = require('node:path');
+const { randomBytes } = require('node:crypto');
+const { URL } = require('node:url');
+const { stringify } = require('node:querystring');
+const { statSync, existsSync, mkdirSync, readdirSync } = require('node:fs');
 const { readFile, writeFile } = require('node:fs/promises');
 const { EventEmitter } = require('node:events');
 const { Readable } = require('node:stream');
@@ -21,9 +24,177 @@ const { ScalingBloomFilter } = require('@yipsec/blossom').bloom;
 const { Node, Contact, constants } = require('@yipsec/kdns');
 const { consensus, events, log } = require('@yipsec/brig');
 const { dag, tree } = require('@yipsec/merked');
-const { Storage } = require('./lib/storage');
-const { Readable } = require('node:stream');
-const { randomBytes } = require('node:crypto');
+
+
+class Storage {
+
+  constructor(dirpath) {
+    this.root = dirpath;
+
+    if (!existsSync(this.root)) {
+      mkdirSync(this.root, { recursive: true });
+    } else {
+      if (statSync(this.root).isFile()) {
+        throw new Error('Invalid storage path');
+      }
+    }
+  }
+
+  has(key) {
+    return Promise.resolve(this._exists(key));
+  }
+
+  get(hash) {
+    return new Promise(async (resolve, reject) => {
+      const infofile = join(this.root, hash + '.info');
+      
+      let data;
+
+      try {
+        data = await readFile(infofile);
+      } catch (err) {
+        return reject(err);
+      }
+
+      const meta = JSON.parse(data);
+      const datafile = join(this.root, hash + '.part');
+
+      let buffer;
+
+      try {
+        buffer = await readFile(datafile);
+      } catch (err) {
+        return reject(err);
+      }
+
+      const blob = buffer.toString('hex');
+      
+      resolve({ hash, meta, blob });
+    });
+  }
+
+  put(hash, item) {
+    return new Promise(async (resolve, reject) => {
+      let { blob, meta } = item;
+
+      blob  = Buffer.from(blob, 'hex');
+
+      const info = JSON.stringify(meta);
+      const blobInfoPath = join(this.root, key + '.info');
+      const blobDataPath = join(this.root, key + '.part');
+
+      try {
+        await writeFile(blobDataPath, blob);
+        await writeFile(blobInfoPath, info);
+      } catch (err) {
+        return reject(err);
+      }
+    });
+  }
+
+  del(key) {
+    return new Promise(async (resolve, reject) => {
+      if (!this._exists(key)) {
+        return reject(new Error(key + ' not found'));
+      }
+
+      try {
+        await unlink(path.join(this.root, key + '.info'));
+        await unlink(path.join(this.root, key + '.part'));
+      } catch (err) {
+        return reject(err);
+      }
+
+      resolve();
+    });
+  }
+
+  createReadStream() {
+    const list = readdirSync(this.root).filter((filename) => {
+      return extname(filename) === '.info';
+    }).sort();
+    const rStream = new Readable({
+      objectMode: true,
+      read: async () => {
+        const info = list.shift();
+
+        if (!info) {
+          return rStream.push(null);
+        }
+
+        try {
+          rStream.push(await this.get(info.split('.')[0]));
+        } catch (err) {
+          this.emit('error', err);
+        }
+      }
+    });
+
+    return rStream;
+  }
+
+  _exists(key) {
+    return existsSync(path.join(this.root, key + '.info')) && 
+      existsSync(path.join(this.root, key + '.part'));
+  }
+
+}
+
+module.exports.Storage = Storage;
+
+
+class Link extends URL {
+
+  /**
+   *
+   *
+   * @constructor
+   */
+  constructor(opts) {
+    super(opts);
+
+    this.protocol = 'damselfish:';
+  }
+
+  /**
+   *
+   *
+   */
+  static fromString(str) {
+    return new Link(str);
+  }
+
+  /**
+   *
+   *
+   *
+   */
+  toString() {
+    return this.href;
+  }
+
+  /**
+   *
+   *
+   *
+   */
+  static fromContact(contact) {
+    return Link.fromString(
+      `damselfish://${contact.fingerprint}?${stringify(contact.address)}`);
+  }
+
+  /**
+   *
+   *
+   */
+  toContact() {
+    return new Contact(this.hostname, 
+      Object.fromEntries(this.searchParams.entries()));
+  }
+
+}
+
+module.exports.Link = Link;
 
 
 class Config {
@@ -215,7 +386,7 @@ class Presence extends EventEmitter {
       }
 
       // Handle routing table events and persist the table state.
-      dht.router
+      dht.router.events
         .on('contact_added', _persistRouterState)
         .on('contact_deleted', _persistRouterState);
 
@@ -455,6 +626,15 @@ class Presence extends EventEmitter {
     
     // Presence is ready and online.
     this.emit(Presence.Events.Ready);
+  }
+
+  /**
+   * Returns a damselfish link for this presence.
+   *
+   * @returns {string}
+   */
+  get link() {
+    return Link.fromContact(this.contact);
   }
 
   /**
