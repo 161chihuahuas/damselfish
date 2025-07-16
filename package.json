@@ -20,9 +20,12 @@
     "@yipsec/merked": "^1.0.1",
     "@yipsec/rise": "^1.0.1",
     "@yipsec/scarf": "^1.0.0",
-    "jsonschema": "^1.5.0"
+    "cli-color": "^2.0.4",
+    "commander": "^14.0.0",
+    "jsonschema": "^1.5.0",
+    "yocto-spinner": "^1.0.0"
   },
-  "description": "🐠 distributed anonymous metadata segment encryption layer for integrated storage (huh?)",
+  "description": "🐠🏴 replicated anonymous databases for privacy-preserving apps",
   "directories": {
     "test": "test",
     "lib": "lib",

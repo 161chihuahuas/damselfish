@@ -217,7 +217,7 @@ class Config {
     };
   }
 
-/**
+  /**
    *
    *
    * @constructor
@@ -333,28 +333,40 @@ class Presence extends EventEmitter {
    * @param {string} [password] - Used for encrypting private keys.
    * @returns {Promise.<Presence>}
    */ 
-  static create(config, password = '') {
+  static create(config, password = '', _loading) {
     config = config || new Config();
+
+    const _dbg = (msg) => {
+      _loading.text = msg;
+    };
 
     return new Promise(async (resolve, reject) => {
       // Get an instance of where we are going to store DHT records locally.
+      _dbg('Loading encrypted graph from: ' + config.DataDirectory);
       const storage = new Storage(config.DataDirectory);
       
       let identity, tor, address;
 
       try {
-        identity = existsSync(config.identity)
+        if (existsSync(config.IdentityKeyPath)) {
+          _dbg('Solution key already exists, decrypting it');
           // If there is a file at the config.identity path, try to unlock it.
-          ? await Identity.unlock(password, 
-            await readFile(config.IdentityKeyPath))
+          identity = await Identity.unlock(password, 
+            await readFile(config.IdentityKeyPath));
+        } else {
+          _dbg('No solution key detected, generating one');
           // Otherwise, generate a new identity
-          : await Identity.generate(6, 90, 5);
+          identity = await Identity.generate(6, 90, 5);
+        }
         
+        _dbg('Solution key found! Saving it...')
         // Save the generated identity encrypted to disk.
         await writeFile(config.IdentityKeyPath, identity.lock(password))
 
+        _dbg('Establishing a secure context through the Tor network');
         // Bootstrap a Tor context before doing anything else!
         tor = await TorContext.create();
+        _dbg('Connected to Tor');
       } catch (e) {
         // Do not proceed if either fail.
         return reject(e);
@@ -377,10 +389,12 @@ class Presence extends EventEmitter {
 
       // If there is a a routing table cached already, populated from it.
       if (existsSync(config.RoutingTable)) {
+        _dbg('Found routing table cache, decrypting it');
         const cachedContactList = Message.fromBuffer(
           await readFile(config.RoutingTable)
         ).decrypt(identity.secret.privateKey).unwrap();
 
+        _dbg('Populating router with cached contacts');
         for (let fingerprint in cachedContactList) {
           dht.router.addContact(fingerprint, new Contact(
             cachedContactList[fingerprint],
@@ -454,13 +468,21 @@ class Presence extends EventEmitter {
       try {
         // If we have already created an onion service before, load the 
         // encrypted private key, decrypt it.
-        let onion = existsSync(config.OnionKeyPath)
-          ? Message.fromBuffer(await readFile(config.OnionKeyPath))
-              .decrypt(identity.secret.privateKey)
-              .unwrap()
-          // Otherwise we will create one...
-          : null;
+        let onion;
 
+        if (existsSync(config.OnionKeyPath)) {
+          _dbg('Hidden service key detected, decrypting it');
+          onion = Message.fromBuffer(await readFile(config.OnionKeyPath))
+            .decrypt(identity.secret.privateKey)
+            .unwrap(); 
+          _dbg('Decrypted hidden service key')
+        } else {
+          // Otherwise we will create one...
+          onion = null;
+        }
+
+        _dbg('Establishing Tor onion service.');
+        
         // Bind/create onion service.
         address = await server.server.listen({
           keyType: onion ? onion.privateKey.split(':')[0] : 'NEW',
@@ -468,13 +490,18 @@ class Presence extends EventEmitter {
         });
 
         // Encrypt the private key.
-        onion = identity.message(identity.secret.publicKey, {
-          privateKey: server.server.privateKey,
-          serviceId: server.server.serviceId
-        }).toBuffer();
+        if (!onion) {
+          onion = {
+            privateKey: server.server.privateKey,
+            serviceId: server.server.serviceId
+          };
+
+          onion = identity
+            .message(identity.secret.publicKey, onion).toBuffer();
         
-        // Write the encrypted private key to disk.
-        await writeFile(config.OnionKeyPath, onion);
+          // Write the encrypted private key to disk.
+          await writeFile(config.OnionKeyPath, onion);
+        }
       } catch (e) {
         return reject(e);
       }
@@ -495,6 +522,7 @@ class Presence extends EventEmitter {
         clusters: []
       });
 
+      _dbg('Loading clusters manifest');
       const clustersManifest = existsSync(config.ClustersManifest)
         ? Message.fromBuffer(await readFile(config.ClustersManifest))
           .decrypt(identity.secret.privateKey)
@@ -503,9 +531,11 @@ class Presence extends EventEmitter {
 
       // Setup clusters (groups of nodes replicating an encrypted log).
       clustersManifest.forEach(async clusterDef => {
+        _dbg('Bootstrapping cluster: ' + clusterDef.localkey);
         await presence.createCluster(clusterDef.members, clusterDef.localkey);  
       });
 
+      _dbg('Loading linked clients');
       let linkedClients = existsSync(config.LinkedClients)
         ? Message.fromBuffer(await readFile(config.LinkedClients))
             .decrypt(identity.secret.privateKey)
@@ -513,6 +543,7 @@ class Presence extends EventEmitter {
         : {};
 
       for (let publicKey in linkedClients) {
+        _dbg('Linking controller client: ' + publicKey);
         await presence.linkControllerClient(publicKey, linkedClients[publicKey]);
       }
 
@@ -682,6 +713,15 @@ class Presence extends EventEmitter {
         resolve(dag.DAG.fromBuffer(Buffer.concat(
           await Promise.all(graphMeta.l.map(leaf => {
             return new Promise(async (resolve, reject) => {
+              if (this.storage.has(leaf)) {
+                try {
+                  resolve(await this.storage.get(leaf).blob);
+                  return;
+                } catch (err) {
+                  // noop
+                }
+              }
+
               try {
                 resolve(await this.dht.iterativeFindValue(leaf));
               } catch (err) {
@@ -896,7 +936,12 @@ class Presence extends EventEmitter {
    *
    */
   createControllerInterface() {
-    const api = {};
+    const api = {
+      // TODO add/remove contacts
+      // TODO get info
+      // TODO create cluster
+      // TODO destroy cluster
+    };
 
     const apiFactory = (localkey = 'default', queryStr, respond) => {
       return async (queryStr, respond) => {
@@ -966,6 +1011,12 @@ class Presence extends EventEmitter {
               return repond(e);
             }
             break;
+          case '&':
+            // TODO addPeer
+            break;
+          case '!':
+            // TODO removePeer
+            break;
           default:
             return respond(new Error('Invalid token "' + token + '"'));
         }
@@ -975,7 +1026,7 @@ class Presence extends EventEmitter {
     };
 
     for (let [key, collection] of this.collections.entries()) {
-      api[`@${key}`] = (queryStr, repond) => {
+      api[`@${key}`] = (queryStr, respond) => {
         return apiFactory(key)(queryStr, respond);
       };
     }
@@ -1128,9 +1179,38 @@ class Collection {
    *
    */
   get data() {
-    return this.cluster.state.log.entries.map(logEntry => {
+    const data = this.cluster.state.log.entries.map(logEntry => {
       return Message.from(logEntry.payload);
+    }).map(msg => {
+      let meta;
+
+      try {
+        meta = msg.decrypt(this.identity.secret.privateKey);
+      } catch (e) {
+        meta = null;
+      }
+
+      return meta;
+    }).filter(meta => !!meta).filter(meta => {
+      if (this.validator) {
+        return this.validator.validate(meta.index).valid;
+      }
+      return true;
     });
+
+    data.forEach(meta => {
+      if (meta.index.__tombstone === true) {
+        if (typeof meta.index.__position === 'undefined') {
+          return;
+        }
+
+        data[meta.index.__position].index = {
+          __tombstone: true
+        };
+      }  
+    });
+
+    return data.map(meta => !meta.__tombstone);
   }
 
   /**
@@ -1144,26 +1224,8 @@ class Collection {
       let results;
 
       try {
-        results = jsonquery(this.data
-          .map(msg => {
-            let meta;
-
-            try {
-              meta = msg.decrypt(this.identity.secret.privateKey);
-            } catch (e) {
-              meta = null;
-            }
-
-            return meta;
-          })
-          .filter(meta => !!meta && !meta.index.__tombstone)
-          .filter(meta => {
-            if (this.validator) {
-              return this.validator.validate(meta.index).valid;
-            }
-            return true;
-          })
-        , exp).map(async meta => await this.presence.readGraph(meta.graph));
+        results = jsonquery(this.data, exp).map(async meta => 
+          await this.presence.readGraph(meta.graph));
       } catch (e) {
         return reject(e);
       }
