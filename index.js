@@ -9,13 +9,15 @@
 
 const { homedir } = require('node:os');
 const { join, extname } = require('node:path');
-const { randomBytes } = require('node:crypto');
+const { randomBytes, randomUUID } = require('node:crypto');
 const { URL } = require('node:url');
 const { stringify } = require('node:querystring');
 const { statSync, existsSync, mkdirSync, readdirSync } = require('node:fs');
 const { readFile, writeFile } = require('node:fs/promises');
 const { EventEmitter } = require('node:events');
 const { Readable } = require('node:stream');
+
+const { Validator } = require('jsonschema');
 
 const { Client, Server } = require('@yipsec/scarf');
 const { Identity, Message } = require('@yipsec/rise');
@@ -24,6 +26,7 @@ const { ScalingBloomFilter } = require('@yipsec/blossom').bloom;
 const { Node, Contact, constants } = require('@yipsec/kdns');
 const { consensus, events, log } = require('@yipsec/brig');
 const { dag, tree } = require('@yipsec/merked');
+const { MerkleTree } = require('@yipsec/merked/lib/tree');
 
 
 class Storage {
@@ -311,6 +314,7 @@ class Presence extends EventEmitter {
     this.server = options.server;
     this.dht = options.dht;
     this.clusters = new Map();
+    this.collections = new Map();
     this.clients = new Set(options.clients);
 
     for (let c = 0; c < options.clusters.length; c++) {
@@ -480,34 +484,6 @@ class Presence extends EventEmitter {
       contact.address.host = address.host;
       contact.address.port = address.port;
 
-      const clustersManifest = existsSync(config.ClustersManifest)
-        ? Message.fromBuffer(await readFile(config.ClustersManifest))
-          .decrypt(identity.secret.privateKey)
-          .unwrap()
-        : [];
-
-      // Setup clusters (groups of nodes replicating an encrypted log).
-      const clusters = clustersManifest.map(async clusterDef => {
-        // The peer list in the configuration is converted into a list of Peer 
-        // objects.
-        const peers = clusterDef.members.map(fingerprint => {
-          return new consensus.Peer(fingerprint);
-        });
-        
-        // Create a special key to store cluster config locally.
-        const clusterKey = `.CLUSTER_${clusterDef.localkey}`;
-
-        // Check there is a log file at the given path.
-        const logState = storage.has(clusterKey)
-          // Load it from disk.
-          ? log.LogState.deserialize((await storage.get(clusterKey)).blob)
-          // Otherwise just create a new one.
-          : new log.LogState();
-
-        // Create a cluster context.
-        return new consensus.Cluster(clusterDef.localkey, peers, logState);
-      });
-
       // We can now establish a Presence on the network.
       const presence = new Presence({
         storage,
@@ -516,7 +492,18 @@ class Presence extends EventEmitter {
         contact,
         server,
         dht,
-        clusters
+        clusters: []
+      });
+
+      const clustersManifest = existsSync(config.ClustersManifest)
+        ? Message.fromBuffer(await readFile(config.ClustersManifest))
+          .decrypt(identity.secret.privateKey)
+          .unwrap()
+        : [];
+
+      // Setup clusters (groups of nodes replicating an encrypted log).
+      clustersManifest.forEach(async clusterDef => {
+        await presence.createCluster(clusterDef.members, clusterDef.localkey);  
       });
 
       let linkedClients = existsSync(config.LinkedClients)
@@ -585,45 +572,6 @@ class Presence extends EventEmitter {
       this.storage.createReadStream().pipe(expirerStream);
     });
 
-    // Bootstrap all of our clusters.
-    for (let cluster of this.clusters.values()) {
-      // We need to link up the transport to each peer object in the cluster.
-      for (let p = 0; p < cluster.peers.length; p++) {
-        const peer = cluster.peers[p];
-
-        // Deliver the message to the underlying hidden socket.
-        peer.on(events.MessageQueued, (fingerprint, message) => {
-          // The cluster ID is the RPC method namespace.
-     const method = `CLUSTER_${cluster.id}/${message.constructor.method}`;
-
-          this.send(this.dht.router.getContactById(fingerprint), 
-            method, [message]).then(acked => acked, err => err); 
-        });
-      }
-
-      // We need to persist each cluster's log state to disk periodically.
-      // When an entry is commited is a time to do it.
-      cluster.on(events.LogCommit, async (_logEntry) => {
-        await this.storage.put(`.CLUSTER_${cluster.id}`, {
-          blob: cluster.log.serialize().toString('hex'),
-          meta: {
-            timestamp: Date.now(),
-            publisher: this.identity.fingerprint.toString('hex')
-          }
-        });
-        this.emit(Presence.Events.TimelineUpdated, cluster.id, _logEntry);
-      });
-
-      // Get the protocol handlers for out cluster log replication.
-      const cMethods = cluster.createProtocolMapping();
-      
-      // We need to create namespaced method handlers, so multiple clusters
-      // exist on the same node.
-      for (let method in cMethods) {
-        this.server.api[`CLUSTER_${cluster.id}/${method}`] = cMethods[method];
-      }
-    }
-    
     // Presence is ready and online.
     this.emit(Presence.Events.Ready);
   }
@@ -753,20 +701,24 @@ class Presence extends EventEmitter {
    * is persisted to maintain updated local contact list cache.
    *
    * @param {string} contactLink - The node URL referencing another presence.
-   * @returns {Promise.<TODO>}
+   * @returns {Promise}
    */
   addContact(contactLink) {
-    // TODO
+    const contact = Link.fromString(contactLink).toContact();
+
+    this.dht.router.addContactByNodeId(contact.fingerprint, contact);
+    return this.dht.join(contact);
   }
 
   /**
    * Removes the contact from the routing table.
    *
    * @param {string} fingerprint - Node fingerprint to remove.
-   * @returns {Promise.<TODO>}
+   * @returns {Promise}
    */
   removeContact(contactFingerprint) {
-    // TODO
+    this.dht.router.removeContactByNodeId(contactFingerprint);
+    return Promise.resolve();
   } 
 
   /**
@@ -777,8 +729,94 @@ class Presence extends EventEmitter {
    *
    * 
    */
-  createCluster() {
-    // TODO
+  createCluster(members = [], localkey = 'default') {
+    if (this.clusters.has(localkey)) {
+      return Promise.reject(
+        new Error('Cluster with local key "' + localkey + '" already exists.')
+      );
+    }
+
+    return new Promise(async (resolve, reject) => {
+      // The peer list in the configuration is converted into a list of Peer 
+      // objects.
+      const peers = members.map(fingerprint => {
+        return new consensus.Peer(fingerprint, _deliverMsg);
+      });
+
+      const _deliverMsg = (id, msg) => {
+        let client = this.peers.get(id);
+        const contact = this.dht.router.getContactById(id);
+
+        if (!client) {
+          client = new Client();
+
+          client.stream.on('connect', () => {
+            this.peers.set(id, client);
+            client.invoke(msg.constructor.method, [msg]);
+          }).on('error', (err) => {
+            this.peers.delete(id);
+          });
+
+          client.connect(contact.address.port);
+        } else {
+          client.invoke(msg.constructor.method, [msg]);
+        }
+      };
+
+      // Create a special key to store cluster config locally.
+      localkey = localkey || randomUUID();
+      const clusterKey = `.CLUSTER_${localkey}`;
+
+      // Check there is a log file at the given path.
+      const logState = this.storage.has(clusterKey)
+        // Load it from disk.
+        ? log.LogState.deserialize((await storage.get(clusterKey)).blob)
+        // Otherwise just create a new one.
+        : new log.LogState();
+
+      // Create a cluster context.
+      const cluster = new consensus.Cluster(localkey, peers, logState);
+
+      // We need to link up the transport to each peer object in the cluster.
+      for (let p = 0; p < cluster.peers.length; p++) {
+        const peer = cluster.peers[p];
+
+        // Deliver the message to the underlying hidden socket.
+        peer.on(events.MessageQueued, (fingerprint, message) => {
+          // The cluster ID is the RPC method namespace.
+          const method = `CLUSTER_${cluster.id}/${message.constructor.method}`;
+
+          this.send(this.dht.router.getContactById(fingerprint), 
+            method, [message]).then(acked => acked, err => err); 
+        });
+      }
+
+      // We need to persist each cluster's log state to disk periodically.
+      // When an entry is commited is a time to do it.
+      cluster.on(events.LogCommit, async (_logEntry) => {
+        await this.storage.put(`.CLUSTER_${cluster.id}`, {
+          blob: cluster.log.serialize().toString('hex'),
+          meta: {
+            timestamp: Date.now(),
+            publisher: this.identity.fingerprint.toString('hex')
+          }
+        });
+        this.emit(Presence.Events.TimelineUpdated, cluster.id, _logEntry);
+      });
+
+      // Get the protocol handlers for out cluster log replication.
+      const cMethods = cluster.createProtocolMapping();
+      
+      // We need to create namespaced method handlers, so multiple clusters
+      // exist on the same node.
+      for (let method in cMethods) {
+        this.server.api[`CLUSTER_${cluster.id}/${method}`] = cMethods[method];
+      }
+
+      this.clusters.set(cluster.id, cluster);
+      this.collections.set(localkey, new Collection(cluster, this, localkey));
+      resolve(cluster);
+    });
   }
 
   /**
@@ -786,8 +824,29 @@ class Presence extends EventEmitter {
    *
    *
    */
-  destroyCluster() {
-    // TODO
+  destroyCluster(localkey) {
+    return new Promise(async (resolve, reject) => {
+      const clusterKey = `.CLUSTER_${localkey}`;
+      const cluster = this.clusters.get(localkey);
+
+      if (!cluster) {
+        return reject(new Error('Cluster not found.'));
+      }
+
+      this.storage.del(clusterKey)
+      cluster.removeAllListeners();
+
+      const cMethods = cluster.createProtocolMapping();
+      
+      for (let method in cMethods) {
+        this.server.api[`CLUSTER_${cluster.id}/${method}`] = null;
+      }
+
+      this.clusters.del(localkey);
+      this.collections.del(localkey);
+      resolve();
+    });
+
   }
 
   /**
@@ -837,9 +896,91 @@ class Presence extends EventEmitter {
    *
    */
   createControllerInterface() {
-    return {
-      // TODO
+    const api = {};
+
+    const apiFactory = (localkey = 'default', queryStr, respond) => {
+      return async (queryStr, respond) => {
+        const collection = this.collections.get(localkey);
+
+        if (!collection) {
+          return respond(new Error(`Collection "${localkey}" not found.`));
+        }
+
+        let result = null;
+        const token = queryStr.substring(0, 1);
+
+        switch (token) {
+          case '$':
+            try {
+              result = await collection.get(queryStr.substring(1));
+            } catch (e) {
+              return respond(e);
+            }
+            break;
+          case '~':
+            try {
+              result = await collection.tail(queryStr.substring(1));
+            } catch (e) {
+              return respond(e);
+            }
+            break;
+          case '+':
+            const [blob, index] = queryStr.substring(1).split('/');
+            try {
+              result = await collection.put(Buffer.from(blob, 'hex'), json 
+                ? JSON.parse(index)
+                : {});
+            } catch (e) {
+              return respond(e);
+            }
+            break;
+          case '-':
+            try {
+              result = await collection.tombstone(queryStr.substring(1));
+            } catch (e) {
+              return respond(e);
+            }
+            break;
+          case '^':
+            const [exp, patch] = queryStr.substring(1).split('/');
+            try {
+              result = await collection.patch(exp, patch 
+                ? JSON.parse(patch)
+                : {});
+            } catch (e) {
+              return respond(e);
+            }
+            break;
+          case '%':
+            try {
+              let schema = queryStr.substring(1)
+                ? JSON.parse(queryStr.substring(1))
+                : null;
+
+              if (schema) {
+                result = await collection.validate(schema);
+              } else {
+                result = collection.schema;
+              }
+            } catch (e) {
+              return repond(e);
+            }
+            break;
+          default:
+            return respond(new Error('Invalid token "' + token + '"'));
+        }
+
+        respond(null, [result])
+      };
     };
+
+    for (let [key, collection] of this.collections.entries()) {
+      api[`@${key}`] = (queryStr, repond) => {
+        return apiFactory(key)(queryStr, respond);
+      };
+    }
+
+    return api;
   }
 
   /**
@@ -942,3 +1083,254 @@ class Presence extends EventEmitter {
 }
 
 module.exports.Presence = Presence;
+
+
+class Collection {
+
+  /**
+   *
+   *
+   * @constructor
+   * @param {external:Cluster} cluster - The cluster replicating the log.
+   * @param {Presence} presence - Network presence for lookups.
+   * @param {string} [shortname='default'] - Local identifier for this collection.
+   */
+  constructor(cluster, presence, shortname = 'default') {
+    this.cluster = cluster;
+    this.shortname = shortname;
+    this.validator = null;
+    this.schema = null;
+    this.presence = presence;
+  }
+
+  validate(jsonSchema) {
+    if (!jsonSchema) {
+      this.schema = null;
+      this.validator = null;
+      return Promise.resolve({});
+    }
+
+    return new Promise((resolve, reject) => {
+      this.validator = new Validator();
+     
+      try {
+        this.validator.addSchema(jsonSchema);
+      } catch (e) {
+        return reject(e);
+      }
+
+      resolve(jsonSchema);
+    });
+  }
+
+  /**
+   *
+   *
+   */
+  get data() {
+    return this.cluster.state.log.entries.map(logEntry => {
+      return Message.from(logEntry.payload);
+    });
+  }
+
+  /**
+   *
+   *
+   */
+  get(exp) {
+    return new Promise(async (resolve, reject) => {
+      const { jsonquery } = await import('@jsonquerylang/jsonquery').default;
+      
+      let results;
+
+      try {
+        results = jsonquery(this.data
+          .map(msg => {
+            let meta;
+
+            try {
+              meta = msg.decrypt(this.identity.secret.privateKey);
+            } catch (e) {
+              meta = null;
+            }
+
+            return meta;
+          })
+          .filter(meta => !!meta && !meta.index.__tombstone)
+          .filter(meta => {
+            if (this.validator) {
+              return this.validator.validate(meta.index).valid;
+            }
+            return true;
+          })
+        , exp).map(async meta => await this.presence.readGraph(meta.graph));
+      } catch (e) {
+        return reject(e);
+      }
+
+      resolve(results);
+    });
+  } 
+
+  /**
+   *
+   *
+   *
+   */
+  put(buffer, index) {
+    return new Promise(async (resolve, reject) => {
+      let graph;
+
+      if (this.validator) {
+        const validatorResult = this.validator.validate(index);
+
+        if (!validatorResult.valid) {
+          return reject(validatorResult.errors[0]);
+        }
+      }
+
+      const filter = new ScalingBloomFilter();
+      filter.add(JSON.stringify(index || {}));
+
+      const tree = new MerkleTree([buffer, 
+        Buffer.from(JSON.stringify(filter))]);
+
+      const hash = tree.root();
+
+      try {
+        graph = await this.presence.writeGraph(buffer, 
+          `/${this.presence.identity.fingerprint}/${this.hash}.fish`);
+      } catch (e) {
+        return reject(e);
+      }
+
+      let entries = [];
+
+      try {
+        for (let p = 0; p < this.cluster.peers.length; p++) {
+          const fingerprint = this.cluster.peers[p].id;
+          const pubkey = this.presence.dht.router.getContactById(fingerprint)
+            .address.pubkey;
+
+          entries.push(this.presence.identity.message(
+            pubkey,
+            { graph, index },
+            { op: 'put' }
+          ));
+        }
+      } catch (e) {
+        return reject(e);
+      }
+   
+      entries.forEach(entry => this.cluster.broadcast(entry));
+      resolve(entries);
+    });
+  }
+
+  /**
+   *
+   * 
+   *
+   */
+  tombstone(exp) {
+    return this.patch(exp, {}, false);
+  }
+
+  /**
+   *
+   *
+   *
+   */
+  patch(exp, json, patch = true) {
+    return new Promise(async (resolve, reject) => {
+      const { jsonquery } = await import('@jsonquerylang/jsonquery').default;
+      const results = jsonquery(this.data, exp)
+        .filter(entry => !entry.index.__tombstone);
+
+      const entries = results.map(entry => {
+        const logEntryIndex = this.cluster.state.log.entries.indexOf(entry);
+
+        return [
+          logEntryIndex, 
+          { index: entry.payload.index, ...json }
+        ];
+      });
+
+      const messages = [];
+
+      try {
+        for (let e = 0; e < entries.length; e++) {
+          const { __position, index } = entries[e];
+
+          for (let p = 0; p < this.cluster.peers.length; p++) {
+            const fingerprint = this.cluster.peers[p].id;
+            const pubkey = this.presence.dht.router.getContactById(fingerprint)
+              .address.pubkey;
+
+            messages.push(this.presence.identity.message(
+              pubkey,
+              { 
+                graph: null, 
+                index: { 
+                  __position, 
+                  __tombstone: true 
+                } 
+              },
+              { op: 'tombstone'}
+            ));
+            
+            if (patch) {
+              messages.push(this.presence.identity.message(
+                pubkey,
+                { graph, index },
+                { op: 'patch' }
+              ));
+            }
+          }
+        }
+      } catch (e) {
+        return reject(e);
+      }
+   
+      messages.forEach(message => this.cluster.broadcast(message));
+      resolve(entries);
+    });
+  }
+
+  /**
+   *
+   *
+   *
+   */
+  tail(exp) {
+    return new Promise(async (resolve, reject) => {
+      let result;
+
+      try {
+        result = await this.get(exp);
+      } catch (e) {
+        return reject(e);
+      }
+
+      const cluster = this.cluster;
+      const cursor = new Readable({
+        read() {
+          const entry = result.unshift();
+
+          if (entry) {
+            return this.push(entry)
+          }
+
+          cluster.once(LogCommit, (committed) => {
+            this.push(committed);
+          });
+        }
+      });
+
+      resolve(cursor);
+    });
+  }
+
+}
+
+module.export.Collection = Collection;

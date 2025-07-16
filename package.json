@@ -4,7 +4,7 @@
     "email": "161chihuahuas@disroot.org"
   },
   "bin": {
-    "fishd": "bin/fishd.js",
+    "damselfish": "bin/damselfish.js",
     "fin": "bin/fin.js"
   },
   "bugs": {
@@ -12,13 +12,15 @@
   },
   "contributors": [],
   "dependencies": {
+    "@jsonquerylang/jsonquery": "^5.0.4",
     "@yipsec/blossom": "^1.0.0",
     "@yipsec/brig": "^1.0.0",
     "@yipsec/bulb": "^4.0.0",
     "@yipsec/kdns": "^8.0.2",
     "@yipsec/merked": "^1.0.1",
     "@yipsec/rise": "^1.0.1",
-    "@yipsec/scarf": "^1.0.0"
+    "@yipsec/scarf": "^1.0.0",
+    "jsonschema": "^1.5.0"
   },
   "description": "🐠 distributed anonymous metadata segment encryption layer for integrated storage (huh?)",
   "directories": {
