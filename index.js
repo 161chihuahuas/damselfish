@@ -1333,4 +1333,4 @@ class Collection {
 
 }
 
-module.export.Collection = Collection;
+module.exports.Collection = Collection;
