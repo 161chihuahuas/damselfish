@@ -4,14 +4,14 @@
     "email": "161chihuahuas@disroot.org"
   },
   "bin": {
-    "damselfish": "bin/damselfish.js",
-    "fin": "bin/fin.js"
+    "fishdb": "bin/damselfish.js"
   },
   "bugs": {
     "url": "https://github.com/161chihuahuas/damselfish/issues"
   },
   "contributors": [],
   "dependencies": {
+    "@inquirer/prompts": "^7.6.0",
     "@jsonquerylang/jsonquery": "^5.0.4",
     "@yipsec/blossom": "^1.0.0",
     "@yipsec/brig": "^1.0.0",
@@ -25,7 +25,7 @@
     "jsonschema": "^1.5.0",
     "yocto-spinner": "^1.0.0"
   },
-  "description": "🐠🏴 replicated anonymous databases for privacy-preserving apps",
+  "description": "replicated anonymous databases for privacy-preserving apps",
   "directories": {
     "test": "test",
     "lib": "lib",

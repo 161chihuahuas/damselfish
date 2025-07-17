@@ -213,7 +213,8 @@ class Config {
       ClustersManifest: join(datadir, 'clusters_manifest.encrypted'),
       OnionKeyPath: join(datadir, 'address_key.encrypted'),
       LinkedClients: join(datadir, 'linked_clients.encrypted'),
-      RoutingTable: join(datadir, 'routing_table.encrypted')
+      RoutingTable: join(datadir, 'routing_table.encrypted'),
+      ControlSocket: join(datadir, 'control.sock')
     };
   }
 
@@ -338,6 +339,11 @@ class Presence extends EventEmitter {
 
     const _dbg = (msg) => {
       _loading.text = msg;
+
+      if (process.channel) {
+        process.send({ debug: msg });
+        process.disconnect();
+      }
     };
 
     return new Promise(async (resolve, reject) => {
@@ -365,7 +371,22 @@ class Presence extends EventEmitter {
 
         _dbg('Establishing a secure context through the Tor network');
         // Bootstrap a Tor context before doing anything else!
-        tor = await TorContext.create();
+        tor = new TorContext();
+
+        process.once('uncaughtException', reject);
+        process.once('unhandledRejection', reject);
+ 
+        try {
+          await tor.spawnTorChildProcess();
+          _dbg('Tor connection established, opening control connection');
+          await tor.openControlConnection();
+          _dbg('Control connection successful');
+        } catch (e) {
+          return reject(e);
+        }
+     
+        process.removeListener('uncaughtException', reject);
+        process.removeListener('unhandledRejection', reject);
         _dbg('Connected to Tor');
       } catch (e) {
         // Do not proceed if either fail.
@@ -542,10 +563,22 @@ class Presence extends EventEmitter {
             .unwrap()
         : {};
 
-      for (let publicKey in linkedClients) {
-        _dbg('Linking controller client: ' + publicKey);
-        await presence.linkControllerClient(publicKey, linkedClients[publicKey]);
+      try {
+        for (let publicKey in linkedClients) {
+          _dbg('Linking controller client: ' + publicKey);
+          await presence.linkControllerClient(publicKey, 
+            linkedClients[publicKey], () => tor.createServer());
+        }
+
+      _dbg('Linking controller client: ' + 
+        Buffer.from(identity.secret.publicKey).toString('base64'));
+
+        await presence.linkControllerClient(presence.identity.secret.publicKey, 
+          config.ControlSocket);
+      } catch (e) {
+        return reject(e);
       }
+      
 
       resolve(presence);
     });
@@ -1040,19 +1073,14 @@ class Presence extends EventEmitter {
    *
    * 
    */
-  linkControllerClient(clientPublicKey, serverOpts) {
+  linkControllerClient(clientPublicKey, serverOpts, createServer) {
     const controllerApi = this.createControllerInterface();
     const clientToken = randomBytes(32);
     const clientChallenge = randomBytes(64);
 
-    const controlServer = new Server({}, () => 
-      this.tor.createServer());
+    const controlServer = new Server({}, createServer);
 
     let didRegister = typeof clientPublicKey === 'string';
-
-    controlServer.api = didRegister
-      ? { challenge, authenticate }
-      : { register };
 
     const register = async (token, _clientPublicKey, respond) => {
       if (token === clientToken.toString('hex')) {
@@ -1091,17 +1119,27 @@ class Presence extends EventEmitter {
       respond(null, Object.keys(controllerApi));
     }
 
+    controlServer.api = didRegister
+      ? { challenge, authenticate }
+      : { register };
+
     return new Promise(async (resolve, reject) => {
       let address;
+
+      const _done = () => {
+        this._controlServers.set(clientPublicKey, controlServer);
+        resolve({ address, token: clientToken });
+      };
+      
+      if (typeof serverOpts === 'string') {
+        return controlServer.listen(serverOpts, _done);
+      }
 
       try {
         address = await controlServer.server.listen(serverOpts);
       } catch (e) {
         return reject(e);
       }
-
-      this._controlServers.set(clientPublicKey, controlServer);
-      resolve({ address, token: clientToken });
     });
   }
 
