@@ -1443,3 +1443,22 @@ class Collection {
 }
 
 module.exports.Collection = Collection;
+
+module.exports.Identity = Identity;
+module.exports.Client = Client;
+module.exports.Validator = Validator;
+module.exports.Server = Server;
+module.exports.Message = Message;
+module.exports.TorContext = TorContext;
+module.exports.ScalingBloomFilter = ScalingBloomFilter;
+module.exports.Node = Node;
+module.exports.Contact = Contact;
+module.exports.MerkleTree = MerkleTree;
+module.exports.Peer = consensus.Peer;
+module.exports.Cluster = consensus.Cluster;
+module.exports.Cluster.Events = events;
+module.exports.LogEntry = log.LogEntry;
+module.exports.Log = log.Log;
+module.exports.LogState = log.LogState;
+module.exports.Graph = dag.DAG;
+module.exports.constants = constants;

@@ -4,6 +4,7 @@
 
 const { EventEmitter } = require('node:events');
 const { fork } = require('node:child_process');
+const { readFile } = require('node:fs/promises');
 
 const clc = require('cli-color');
 const Spinner = require('ora').default;
@@ -39,7 +40,7 @@ const theme = {
         case 'done':
         case 'loading':
         default:
-          return clc.bold(text) + ' ~ ';
+          return clc.bold(text);
       }
     },
     error(text) {
@@ -65,7 +66,9 @@ const {
   Config,
   Storage,
   Link,
-  Collection } = require('../index');
+  Collection,
+  Client,
+  Identity } = require('../index');
 
 const program = new Command();
 
@@ -191,14 +194,85 @@ program
   .argument('[query]', 'optionally run given query and exit')
   .option('-c, --connect <address>', 'anonymously connect to a remote database')
   .option('-u, --unlock [password]', 'authentication key decryption passphrase', '')
-  .action(async (fishql, options) => {
-    const loading = Spinner({ 
-      text: `Loading ${datadir || Config.DataDirectory}...`,
-      spinner 
-    }).start()
-    const config = new Config(datadir);
+  .option('-a, --auth <private key path>', '', Config.createDefaults(
+    Config.DataDirectory).IdentityKeyPath)
+  .action(async (query, options) => {
+    let host = options.connect
+      ? Link.fromString(options.connect)
+      : Config.createDefaults(Config.DataDirectory).ControlSocket;
 
-    // TODO
+    const loading = Spinner({ 
+      text: `Connecting to ${host} with key: ${options.auth}...`,
+      spinner 
+    }).start();
+
+    const { search, password, Separator } = await import('@inquirer/prompts');
+
+    let _pass = options.unlock || '';
+
+    if (_pass === true) {
+      _pass = await password({ 
+        message: `Enter passphrase for ${options.auth}`,
+        mask: true,
+        validate: (pass) => {
+          return true;
+        },
+        theme
+      });
+    } 
+    const identity = await Identity.unlock(_pass, 
+      await readFile(options.auth));
+    const createConnection = options.connect
+      ? (await TorContext.create()).createConnection
+      : undefined;
+    const client = new Client(createConnection);
+
+    function _err(e) {
+      loading.stopAndPersist({
+        symbol: theme.prefix.error,
+        text: e.message
+      });
+      process.exit(1);
+    }
+
+    function _close() {
+      loading.stopAndPersist({
+        symbol: theme.prefix.error,
+        text: 'Connection closed.'
+      });
+      process.exit(0);
+    }
+
+    async function _shell() {
+      loading.stopAndPersist({
+        symbol: theme.prefix.done,
+        text: 'Connected!'
+      });
+
+      query = query || await search({
+        message: '~ $ ',
+        source: async (input, { signal }) => {
+          if (!input) {
+            return [];
+          }
+
+          console.log(input, signal)
+
+          return [];
+        },
+        pageSize: 12,
+        validate: async (input) => {
+          return true;
+        },
+        theme
+      });
+    }
+
+    client.connect(host);
+    client.stream
+      .on('connect', _shell)
+      .on('close', _close)
+      .on('error', _err);
   });
 
 if (!process.channel) {
