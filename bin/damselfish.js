@@ -6,7 +6,7 @@ const { EventEmitter } = require('node:events');
 const { fork } = require('node:child_process');
 
 const clc = require('cli-color');
-const Spinner = require('yocto-spinner').default;
+const Spinner = require('ora').default;
 
 const spinner = {
   frames: [
@@ -24,7 +24,9 @@ const spinner = {
 const theme = {
   prefix: { 
     idle: '⸱⸱🫧⸱⸱',
-    done: '⸱⸱🐠⸱⸱'
+    done: '⸱⸱🐠⸱⸱',
+    error: '⸱⸱⛔⸱⸱',
+    help: '⸱⸱ℹ️ ⸱⸱'
   },
   spinner,
   style: {
@@ -41,10 +43,10 @@ const theme = {
       }
     },
     error(text) {
-      return '⛔ ' + clc.bold(text);
+      return theme.prefix.error + ' ' + clc.bold(text) + ' ~ ';
     },
     help(text) {
-      return 'ℹ️ ' + clc.bold(text);
+      return theme.prefix.help + ' ' + clc.bold(text) + ' ~ ';
     }
   }
 };
@@ -54,7 +56,7 @@ const titleArt = `
   (_(  (_( ) ) ) (   )_) (    ) ( (   ) ) 
                  _) (_            _)      
 
-    N©! 2025 yipsec, always antifascist
+         ~  N©! 2025 yipsec  ~
 `;
 
 const { Command } = require('commander');
@@ -97,8 +99,16 @@ program
 
     const loading = Spinner({ 
       text: `Loading ${datadir || Config.DataDirectory}...`,
-      spinner 
+      spinner,
+      discardStdin: false
     }).start();
+
+    process.on('uncaughtException', e => {
+      loading.stopAndPersist({
+        text: e.message,
+        symbol: theme.prefix.error
+      })
+    });
 
     if (options.detach) {
       loading.text = `Opening ${datadir} in the background`;
@@ -124,7 +134,7 @@ program
         }
       });
       cProc.on('disconnect', () => {
-        loading.success(`${datadir} opened in background`);
+        loading.stop(`${datadir} opened in background`);
         process.exit(0);
       });
       cProc.on('exit', (code) => {
@@ -139,19 +149,32 @@ program
       .then(onPresenceCreated, onPresenceError);
 
     async function onPresenceCreated(db) {
-      const text = `${datadir || Config.DataDirectory} loaded!`;
+      const text = `Opened damselfish database: ${datadir || Config.DataDirectory}`;
+
+      // TODO 
 
       if (process.channel) {
         process.send({ debug: text });
         process.disconnect();
       } else {
-        loading.success(text);
+        loading.stopAndPersist({
+          symbol: theme.prefix.done,
+          text
+        });
       }
     }
 
     function onPresenceError(err) {
-      loading.error(err.message);
-      loading.stop();
+      let text = err.message;
+
+      if (err.code === 'EADDRINUSE') {
+        text += ' (is damselfish already running?)'
+      }
+
+      loading.stopAndPersist({
+        symbol: theme.prefix.error,
+        text
+      });
 
       if (process.channel) {
         process.send({ error: err });
@@ -163,12 +186,11 @@ program
   });
 
 program
-  .command('query')
-  .description('execute a database query')
-  .argument('[fishql]', 'quoted fishql query string')
+  .command('shell')
+  .description('run queries on a damselfish database')
+  .argument('[query]', 'optionally run given query and exit')
   .option('-c, --connect <address>', 'anonymously connect to a remote database')
-  .option('-u, --unlock [password]', 'database decryption passphrase', '')
-  .option('-i, --interactive', 'open interactive fishql shell')
+  .option('-u, --unlock [password]', 'authentication key decryption passphrase', '')
   .action(async (fishql, options) => {
     const loading = Spinner({ 
       text: `Loading ${datadir || Config.DataDirectory}...`,

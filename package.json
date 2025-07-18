@@ -23,7 +23,7 @@
     "cli-color": "^2.0.4",
     "commander": "^14.0.0",
     "jsonschema": "^1.5.0",
-    "yocto-spinner": "^1.0.0"
+    "ora": "^8.2.0"
   },
   "description": "replicated anonymous databases for privacy-preserving apps",
   "directories": {

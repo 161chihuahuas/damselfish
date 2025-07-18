@@ -233,6 +233,7 @@ class Config {
     this.OnionKeyPath = DEFAULTS.OnionKeyPath;
     this.LinkedClients = DEFAULTS.LinkedClients;
     this.RoutingTable = DEFAULTS.RoutingTable;
+    this.ControlSocket = DEFAULTS.ControlSocket;
   }
 
 }
@@ -1077,8 +1078,14 @@ class Presence extends EventEmitter {
     const controllerApi = this.createControllerInterface();
     const clientToken = randomBytes(32);
     const clientChallenge = randomBytes(64);
-
     const controlServer = new Server({}, createServer);
+
+    process.on('SIGINT', () => {
+      controlServer.server.close();
+      process.exit(1);
+    });
+    process.on('uncaughtException', () => controlServer.server.close());
+    process.on('unhandledRejection', () => controlServer.server.close());
 
     let didRegister = typeof clientPublicKey === 'string';
 
@@ -1126,17 +1133,19 @@ class Presence extends EventEmitter {
     return new Promise(async (resolve, reject) => {
       let address;
 
+      controlServer.server.on('error', reject);
+      
       const _done = () => {
         this._controlServers.set(clientPublicKey, controlServer);
         resolve({ address, token: clientToken });
       };
-      
-      if (typeof serverOpts === 'string') {
-        return controlServer.listen(serverOpts, _done);
-      }
 
       try {
-        address = await controlServer.server.listen(serverOpts);
+        if (typeof serverOpts === 'string') {
+          controlServer.listen(serverOpts, _done);
+        } else {
+          address = await controlServer.server.listen(serverOpts);
+        }
       } catch (e) {
         return reject(e);
       }
