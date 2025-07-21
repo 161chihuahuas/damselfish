@@ -1075,10 +1075,44 @@ class Presence extends EventEmitter {
    * 
    */
   linkControllerClient(clientPublicKey, serverOpts, createServer) {
+    const { identity, clients, emit } = this;
     const controllerApi = this.createControllerInterface();
     const clientToken = randomBytes(32);
     const clientChallenge = randomBytes(64);
     const controlServer = new Server({}, createServer);
+
+    function _parseMethodSignature(name) {
+      const method = name;
+      const func = controlServer.api[method].toString();
+      const args = func.split(`async function ${method}(`)[1].split(')')[0];
+      const params = args.split(', ').map(s => s.trim());
+      const { description, short } = controlServer.api[method];
+
+      params.pop();
+
+      return {
+        name,
+        value: { method, params },
+        description,
+        short,
+        disabled: false
+      };
+    }
+
+    async function __spec(callback) {
+      if (arguments.length > 1) {
+        return arguments[arguments.length - 1](new Error('Invalid params'));
+      }
+      callback(null, Object.getOwnPropertyNames(controlServer.api).filter(method => {
+          return method[0] !== '_' && method !== 'constructor' &&
+            typeof controlServer.api[method] === 'function';
+        })
+        .map(_parseMethodSignature)
+        .sort((a, b) => b.method < a.method));
+    }
+
+    __spec.description = 'internal method for clients to validate shell input';
+    __spec.short = 'returns supported methods and params';
 
     process.on('SIGINT', () => {
       controlServer.server.close();
@@ -1087,16 +1121,16 @@ class Presence extends EventEmitter {
     process.on('uncaughtException', () => controlServer.server.close());
     process.on('unhandledRejection', () => controlServer.server.close());
 
-    let didRegister = typeof clientPublicKey === 'string';
+    let didRegister = typeof clientPublicKey !== 'undefined';
 
-    const register = async (token, _clientPublicKey, respond) => {
+    async function register(token, _clientPublicKey, respond) {
       if (token === clientToken.toString('hex')) {
         didRegister = true;
         controlServer.api.register = null;
         controlServer.api = { challenge, authenticate };
 
-        this.clients.add(_clientPublicKey);
-        this.emit(Presence.Events.ClientRegistered, {
+        clients.add(_clientPublicKey);
+        emit(Presence.Events.ClientRegistered, {
           clientPublicKey: _clientPublicKey,
           clientToken,
           clientChallenge,
@@ -1108,13 +1142,19 @@ class Presence extends EventEmitter {
       }
     }
 
-    const challenge = (respond) => {
-      respond(null, [this.identity.message(clientPublicKey, {
+    register.description = 'Register a new controller client given the server token and pubkey.';
+    register.short = 'register()';
+
+    async function challenge(respond) {
+      respond(null, [identity.message(clientPublicKey, {
         challenge: clientChallenge.toString('hex')
       })]);
     };
 
-    function authenticate(decryptedChallenge, respond) {
+    challenge.description = 'Request a challenge to decrypt to prove key ownership.';
+    challenge.short = 'challenge()';
+
+    async function authenticate(decryptedChallenge, respond) {
       if (decryptedChallenge !== clientChallenge.toString('hex')) {
         return respond(new Error('Unauthorized.'));
       }
@@ -1126,9 +1166,12 @@ class Presence extends EventEmitter {
       respond(null, Object.keys(controllerApi));
     }
 
+    authenticate.description = 'Establish an authenticated control channel.';
+    authenticate.short = 'authenticate()';
+
     controlServer.api = didRegister
-      ? { challenge, authenticate }
-      : { register };
+      ? { challenge, authenticate, __spec }
+      : { register, __spec };
 
     return new Promise(async (resolve, reject) => {
       let address;

@@ -27,7 +27,8 @@ const theme = {
     idle: '⸱⸱🫧⸱⸱',
     done: '⸱⸱🐠⸱⸱',
     error: '⸱⸱⛔⸱⸱',
-    help: '⸱⸱ℹ️ ⸱⸱'
+    help: '⸱⸱ℹ️ ⸱⸱',
+    result: '⸱⸱🎣⸱⸱'
   },
   spinner,
   style: {
@@ -75,7 +76,8 @@ const program = new Command();
 program
   .name(clc.bold('fishdb'))
   .description(clc.italic(require('../package.json').description))
-  .version(require('../package.json').version);
+  .version(require('../package.json').version)
+  .addHelpText('beforeAll', titleArt);  
 
 program
   .command('open')
@@ -84,199 +86,294 @@ program
   .option('-u, --unlock [password]', 'database decryption passphrase')
   .option('-i, --interactive', 'prompt for user input & open query shell')
   .option('-d, --detach', 'run process in the background')
-  .action(async (datadir, options) => {
-    const { password } = await import('@inquirer/prompts');
+  .action(open);
 
-    let _pass = options.unlock || '';
+async function open(datadir, options) {
+  const { password } = await import('@inquirer/prompts');
 
-    if (_pass === true && options.interactive) {
-      _pass = await password({ 
-        message: `Enter passphrase for ${datadir}`,
-        mask: true,
-        validate: (pass) => {
-          return true;
-        },
-        theme
-      });
-    } 
+  let _pass = options.unlock || '';
 
-    const loading = Spinner({ 
-      text: `Loading ${datadir || Config.DataDirectory}...`,
-      spinner,
-      discardStdin: false
-    }).start();
+  if (_pass === true && options.interactive) {
+    _pass = await password({ 
+      message: `Enter passphrase for ${datadir}`,
+      mask: true,
+      validate: (pass) => {
+        return true;
+      },
+      theme
+    });
+  } 
 
-    process.on('uncaughtException', e => {
-      loading.stopAndPersist({
-        text: e.message,
-        symbol: theme.prefix.error
-      })
+  const loading = Spinner({ 
+    text: `Loading ${datadir || Config.DataDirectory}...`,
+    spinner,
+    discardStdin: false
+  }).start();
+
+  process.on('uncaughtException', e => {
+    loading.stopAndPersist({
+      text: e.message,
+      symbol: theme.prefix.error
+    })
+  });
+
+  if (options.detach) {
+    loading.text = `Opening ${datadir} in the background`;
+    
+    const cProc = fork(__filename, [
+      'open', datadir, 
+      '--unlock', _pass
+    ], {
+      detached: false,
+      sient: true
     });
 
-    if (options.detach) {
-      loading.text = `Opening ${datadir} in the background`;
-      
-      const cProc = fork(__filename, [
-        'open', datadir, 
-        '--unlock', _pass
-      ], {
-        detached: false,
-        sient: true
-      });
-
-      cProc.on('error', err => loading.error(err));
-      cProc.on('message', msg => {
-        if (msg.error) {
-          loading.error(msg.error.message);
-          loading.stop();
-          process.exit(1);
-        } else if (msg.debug) {
-          loading.text = msg.debug;
-        } else {
-          loading.text = msg;
-        }
-      });
-      cProc.on('disconnect', () => {
-        loading.stop(`${datadir} opened in background`);
-        process.exit(0);
-      });
-      cProc.on('exit', (code) => {
-        loading.error('Exited with code ' + code);
-      });
-      return;
-    }
-
-    const config = new Config(datadir);
-
-    Presence.create(config, _pass, loading)
-      .then(onPresenceCreated, onPresenceError);
-
-    async function onPresenceCreated(db) {
-      const text = `Opened damselfish database: ${datadir || Config.DataDirectory}`;
-
-      // TODO 
-
-      if (process.channel) {
-        process.send({ debug: text });
-        process.disconnect();
+    cProc.on('error', err => loading.error(err));
+    cProc.on('message', msg => {
+      if (msg.error) {
+        loading.error(msg.error.message);
+        loading.stop();
+        process.exit(1);
+      } else if (msg.debug) {
+        loading.text = msg.debug;
       } else {
-        loading.stopAndPersist({
-          symbol: theme.prefix.done,
-          text
-        });
+        loading.text = msg;
       }
-    }
+    });
+    cProc.on('disconnect', () => {
+      loading.stop(`${datadir} opened in background`);
+      process.exit(0);
+    });
+    cProc.on('exit', (code) => {
+      loading.error('Exited with code ' + code);
+    });
+    return;
+  }
 
-    function onPresenceError(err) {
-      let text = err.message;
+  const config = new Config(datadir);
 
-      if (err.code === 'EADDRINUSE') {
-        text += ' (is damselfish already running?)'
-      }
+  Presence.create(config, _pass, loading)
+    .then(onPresenceCreated, onPresenceError);
 
+  async function onPresenceCreated(db) {
+    const text = `Opened damselfish database: ${datadir || Config.DataDirectory}`; 
+
+    if (process.channel) {
+      process.send({ debug: text });
+      process.disconnect();
+    } else {
       loading.stopAndPersist({
-        symbol: theme.prefix.error,
+        symbol: theme.prefix.result,
         text
       });
 
-      if (process.channel) {
-        process.send({ error: err });
-        process.disconnect();
-      }
-      
-      process.exit(1);
-    }    
-  });
+      if (options.interactive) {
+        shell(undefined, {
+          connect: config.ControlSocket,
+          unlock: _pass,
+          auth: config.IdentityKeyPath
+        }); 
+      } 
+    }
+  }
+
+  function onPresenceError(err) {
+    let text = err.message;
+
+    if (err.code === 'EADDRINUSE') {
+      text += ' (is damselfish already running?)'
+    }
+
+    loading.stopAndPersist({
+      symbol: theme.prefix.error,
+      text
+    });
+
+    if (process.channel) {
+      process.send({ error: err });
+      process.disconnect();
+    }
+    
+    process.exit(1);
+  }    
+};
 
 program
   .command('shell')
   .description('run queries on a damselfish database')
   .argument('[query]', 'optionally run given query and exit')
-  .option('-c, --connect <address>', 'anonymously connect to a remote database')
+  .option('-c, --connect <address>', 'connect to a custom control socket')
+  .option('-r, --remote', 'connect via tor onion connection')
   .option('-u, --unlock [password]', 'authentication key decryption passphrase', '')
   .option('-a, --auth <private key path>', '', Config.createDefaults(
     Config.DataDirectory).IdentityKeyPath)
-  .action(async (query, options) => {
-    let host = options.connect
-      ? Link.fromString(options.connect)
-      : Config.createDefaults(Config.DataDirectory).ControlSocket;
+  .action(shell);
 
-    const loading = Spinner({ 
+async function shell(query, options) {
+  let host = options.connect
+    ? options.remote ? Link.fromString(options.connect) : options.connect
+    : Config.createDefaults(Config.DataDirectory).ControlSocket;
+
+  let loading, _loader;
+
+  if (!query) {
+    loading = Spinner({ 
       text: `Connecting to ${host} with key: ${options.auth}...`,
       spinner 
     }).start();
+  }
 
-    const { search, password, Separator } = await import('@inquirer/prompts');
+  const { search, password, Separator } = await import('@inquirer/prompts');
 
-    let _pass = options.unlock || '';
+  let _pass = options.unlock || '';
 
-    if (_pass === true) {
-      _pass = await password({ 
-        message: `Enter passphrase for ${options.auth}`,
-        mask: true,
-        validate: (pass) => {
-          return true;
-        },
-        theme
+  if (_pass === true) {
+    _pass = await password({ 
+      message: `Enter passphrase for ${options.auth}`,
+      mask: true,
+      validate: (pass) => {
+        return true;
+      },
+      theme
+    });
+  } 
+  const identity = await Identity.unlock(_pass, 
+    await readFile(options.auth));
+  const createConnection = options.remote
+    ? (await TorContext.create()).createConnection
+    : undefined;
+  const client = new Client(createConnection);
+
+  if (!query) {
+    _loader = Spinner({ 
+      text: clc.italic(query),
+      spinner 
+    });
+  }
+
+  function _err(e) {
+    !query && loading.stopAndPersist({
+      symbol: theme.prefix.error,
+      text: e.message
+    });
+    query && process.stderr.write(JSON.stringify(e));
+    client.stream.destroy();
+    process.exit(1);
+  }
+
+  function _close() {
+    !query && loading.stopAndPersist({
+      symbol: theme.prefix.error,
+      text: 'Connection closed.'
+    });
+    query && process.stderr.write({ message: 'Connection closed.' });
+    client.stream.destroy();
+    process.exit(0)
+  }
+
+  function _connect() {
+    !query && loading.stopAndPersist({
+      symbol: theme.prefix.help,
+      text: 'Welcome to the FishQL shell. ' +
+        `Type ${clc.bold('help')} or ${clc.bold('?')} to get started <3`
+    });
+    _shell();
+  }
+
+  const _done = (err, results) => {
+    if (err) {
+      if (query) {
+        process.stderr.write(JSON.stringify(err) + '\n');
+      } else {
+        _loader.stopAndPersist({
+          symbol: theme.prefix.error,
+          text: err.message
+        });
+      }
+    } else {
+      if (query) {
+        process.stdout.write(JSON.stringify(results) + '\n');
+      } else {
+        _loader.stopAndPersist({
+          symbol: theme.prefix.result,
+          text: JSON.stringify(results)
+        });
+      }
+    }
+    if (query) {
+      client.stream.destroy()
+      process.exit(err ? 1 : 0);
+    } else {
+      _shell();
+    }
+  }
+
+  async function _shell() {
+    let input;
+     
+    function _getMethods() {
+      return new Promise((resolve, reject) => {
+        client.invoke('__spec', [], (err, _methods) => {
+          if (err) {
+            reject(err);
+          } else { 
+            resolve(_methods);
+          }
+        });
       });
-    } 
-    const identity = await Identity.unlock(_pass, 
-      await readFile(options.auth));
-    const createConnection = options.connect
-      ? (await TorContext.create()).createConnection
-      : undefined;
-    const client = new Client(createConnection);
-
-    function _err(e) {
-      loading.stopAndPersist({
-        symbol: theme.prefix.error,
-        text: e.message
-      });
-      process.exit(1);
     }
 
-    function _close() {
-      loading.stopAndPersist({
-        symbol: theme.prefix.error,
-        text: 'Connection closed.'
-      });
-      process.exit(0);
-    }
-
-    async function _shell() {
-      loading.stopAndPersist({
-        symbol: theme.prefix.done,
-        text: 'Connected!'
-      });
-
-      query = query || await search({
+    try {
+      input = query || await search({
         message: '~ $ ',
         source: async (input, { signal }) => {
-          if (!input) {
-            return [];
-          }
+          const methods = [
+            {
+              name: 'help',
+              value: { method: 'help', params: [] },
+              description: 'Show usage information.',
+              short: 'help()'
+            },
+            {
+              name: 'exit',
+              value: { method: 'exit', params: [] },
+              description: 'Close the FishQL shell',
+              short: 'exit()'
+            }
+          ].concat(await _getMethods()).filter(m => m.name[0] !== '_');
 
-          console.log(input, signal)
-
-          return [];
+          return input 
+            ? methods.filter(m => m.name.includes(input))
+            : methods;
         },
-        pageSize: 12,
-        validate: async (input) => {
-          return true;
-        },
+        pageSize: 6,
         theme
       });
+    } catch (e) {
+      return _err(e);
     }
 
-    client.connect(host);
-    client.stream
-      .on('connect', _shell)
-      .on('close', _close)
-      .on('error', _err);
-  });
+    switch (input.method) {
+      case 'help':
+        program.outputHelp();
+        _shell();
+        break;
+      case 'exit':
+        _close();
+        break;
+      default:
+        _loader && _loader.start(); 
+        let q = input.method;
+        console.log(input)
+        client.invoke(input.method, [], _done);
+    }
+  }
 
-if (!process.channel) {
-  console.log(clc.bold(titleArt));
+  client.connect(host);
+  client.stream
+    .on('connect', _connect)
+    .on('close', _close)
+    .on('error', _err);
 }
 
 program.parse();
