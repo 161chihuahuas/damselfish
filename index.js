@@ -20,7 +20,7 @@ const { Readable } = require('node:stream');
 const { Validator } = require('jsonschema');
 
 const { Client, Server } = require('@yipsec/scarf');
-const { Identity, Message } = require('@yipsec/rise');
+const { Identity, Message, SignedMessage, EncryptedMessage } = require('@yipsec/rise');
 const { TorContext } = require('@yipsec/bulb');
 const { ScalingBloomFilter } = require('@yipsec/blossom').bloom;
 const { Node, Contact, constants } = require('@yipsec/kdns');
@@ -102,8 +102,8 @@ class Storage {
       }
 
       try {
-        await unlink(path.join(this.root, key + '.info'));
-        await unlink(path.join(this.root, key + '.part'));
+        await unlink(join(this.root, key + '.info'));
+        await unlink(join(this.root, key + '.part'));
       } catch (err) {
         return reject(err);
       }
@@ -137,8 +137,8 @@ class Storage {
   }
 
   _exists(key) {
-    return existsSync(path.join(this.root, key + '.info')) && 
-      existsSync(path.join(this.root, key + '.part'));
+    return existsSync(join(this.root, key + '.info')) && 
+      existsSync(join(this.root, key + '.part'));
   }
 
 }
@@ -837,14 +837,14 @@ class Presence extends EventEmitter {
         }
       };
 
-      // Create a special key to store cluster config locally.
+      // Create a getapiial key to store cluster config locally.
       localkey = localkey || randomUUID();
       const clusterKey = `.CLUSTER_${localkey}`;
 
       // Check there is a log file at the given path.
-      const logState = this.storage.has(clusterKey)
+      const logState = await this.storage.has(clusterKey)
         // Load it from disk.
-        ? log.LogState.deserialize((await storage.get(clusterKey)).blob)
+        ? log.LogState.deserialize((await this.storage.get(clusterKey)).blob)
         // Otherwise just create a new one.
         : new log.LogState();
 
@@ -901,13 +901,18 @@ class Presence extends EventEmitter {
   destroyCluster(localkey) {
     return new Promise(async (resolve, reject) => {
       const clusterKey = `.CLUSTER_${localkey}`;
-      const cluster = this.clusters.get(localkey);
+      const cluster = await this.clusters.get(localkey);
 
       if (!cluster) {
         return reject(new Error('Cluster not found.'));
       }
 
-      this.storage.del(clusterKey)
+      try {
+        await this.storage.del(clusterKey);
+      } catch (e) {
+        // noop
+      }
+
       cluster.removeAllListeners();
 
       const cMethods = cluster.createProtocolMapping();
@@ -916,8 +921,8 @@ class Presence extends EventEmitter {
         this.server.api[`CLUSTER_${cluster.id}/${method}`] = null;
       }
 
-      this.clusters.del(localkey);
-      this.collections.del(localkey);
+      this.clusters.delete(localkey);
+      this.collections.delete(localkey);
       resolve();
     });
 
@@ -926,7 +931,7 @@ class Presence extends EventEmitter {
   /**
    * Replays the cluster log associated with the given identifier from the 
    * readable end.
-   * Appends the command payload to the log of the specified cluster on the 
+   * Appends the command payload to the log of the getapiified cluster on the 
    * writable end.
    *
    * @param {string} clusterId - The unique UUID v4 assigned to the cluster.
@@ -970,15 +975,71 @@ class Presence extends EventEmitter {
    *
    */
   createControllerInterface() {
-    const api = {
-      // TODO add/remove contacts
-      // TODO get info
-      // TODO create cluster
-      // TODO destroy cluster
-    };
+    const p = this;
+
+    async function peeradd(link, respond) {
+      let result;
+      try {
+        result = await p.addContact(link);
+      } catch (e) {
+        return respond(e);
+      }
+
+      respond(null, result);
+    }
+
+    peeradd.description = 'Add a host to the routing table and initiate lookup.';
+    peeradd.short = 'peeradd()';
+      
+    async function peerdel(fingerprint, respond) {
+      let result;
+      try {
+        result = await p.removeContact(fingerprint);
+      } catch (e) {
+        return respond(e);
+      }
+
+      respond(null, result);
+    }
+
+    peerdel.description = 'Drop the host fingerprint from the routing table.';
+    peerdel.short = 'peerdel()';
+
+    async function clusteradd(name, respond) {
+      let result;
+      try {
+        result = await p.createCluster([], name);
+      } catch (e) {
+        return respond(e);
+      }
+      respond(null, result);
+    }
+
+    clusteradd.description = 'Create a new replicated collection.';
+    clusteradd.short = 'clusteradd()';
+
+    async function clusterdel(name, respond) {
+      let result;
+      try {
+        result = await p.destroyCluster(name);
+      } catch (e) {
+        return respond(e);
+      }
+      respond(null, result);
+    }
+
+    clusterdel.description = 'Delete and unsubscribe from a replicated collection.';
+    clusterdel.short = 'clusterdel()';
+
+    async function statedump(respond) {
+      respond(null, p);
+    }
+
+    statedump.description = 'Get the current state of the database.';
+    statedump.short = 'statedump()';
 
     const apiFactory = (localkey = 'default', queryStr, respond) => {
-      return async (queryStr, respond) => {
+      return async function query(queryStr, respond) {
         const collection = this.collections.get(localkey);
 
         if (!collection) {
@@ -1059,10 +1120,20 @@ class Presence extends EventEmitter {
       };
     };
 
+    const api = {
+      statedump,
+      peeradd,
+      peerdel,
+      clusteradd,
+      clusterdel
+    };
+    
     for (let [key, collection] of this.collections.entries()) {
       api[`@${key}`] = (queryStr, respond) => {
-        return apiFactory(key)(queryStr, respond);
+        return apiFactory(key).call(this, queryStr, respond);
       };
+      api[`@${key}`].description = `Query the cluster named "${key}".`;
+      api[`@${key}`].short = `@${key}()`;
     }
 
     return api;
@@ -1099,7 +1170,7 @@ class Presence extends EventEmitter {
       };
     }
 
-    async function __spec(callback) {
+    async function help(callback) {
       if (arguments.length > 1) {
         return arguments[arguments.length - 1](new Error('Invalid params'));
       }
@@ -1111,8 +1182,8 @@ class Presence extends EventEmitter {
         .sort((a, b) => b.method < a.method));
     }
 
-    __spec.description = 'internal method for clients to validate shell input';
-    __spec.short = 'returns supported methods and params';
+    help.description = 'Show API specification.';
+    help.short = 'help()';
 
     process.on('SIGINT', () => {
       controlServer.server.close();
@@ -1123,11 +1194,11 @@ class Presence extends EventEmitter {
 
     let didRegister = typeof clientPublicKey !== 'undefined';
 
-    async function register(token, _clientPublicKey, respond) {
+    async function _link(token, _clientPublicKey, respond) {
       if (token === clientToken.toString('hex')) {
         didRegister = true;
         controlServer.api.register = null;
-        controlServer.api = { challenge, authenticate };
+        controlServer.api = { _challenge, _link };
 
         clients.add(_clientPublicKey);
         emit(Presence.Events.ClientRegistered, {
@@ -1142,36 +1213,34 @@ class Presence extends EventEmitter {
       }
     }
 
-    register.description = 'Register a new controller client given the server token and pubkey.';
-    register.short = 'register()';
+    _link.description = 'Register a new controller client given the server token and pubkey.';
+    _link.short = '_link()';
 
-    async function challenge(respond) {
+    async function _challenge(respond) {
       respond(null, [identity.message(clientPublicKey, {
         challenge: clientChallenge.toString('hex')
       })]);
     };
 
-    challenge.description = 'Request a challenge to decrypt to prove key ownership.';
-    challenge.short = 'challenge()';
+    _challenge.description = 'Request a challenge to decrypt to prove key ownership.';
+    _challenge.short = '_challenge()';
 
-    async function authenticate(decryptedChallenge, respond) {
+    async function _login(decryptedChallenge, respond) {
       if (decryptedChallenge !== clientChallenge.toString('hex')) {
         return respond(new Error('Unauthorized.'));
       }
 
-      for (let method in controllerApi) {
-        controlServer.api[method] = controllerApi[method];
-      }
+      controlServer.api = { _login, _challenge, help, ...controllerApi };
 
-      respond(null, Object.keys(controllerApi));
+      respond(null, Object.keys(controlServer.api));
     }
 
-    authenticate.description = 'Establish an authenticated control channel.';
-    authenticate.short = 'authenticate()';
+    _login.description = 'Establish an authenticated control channel.';
+    _login.short = '_login()';
 
     controlServer.api = didRegister
-      ? { challenge, authenticate, __spec }
-      : { register, __spec };
+      ? { _login, _challenge, help }
+      : { _link, help };
 
     return new Promise(async (resolve, reject) => {
       let address;
@@ -1492,6 +1561,8 @@ module.exports.Client = Client;
 module.exports.Validator = Validator;
 module.exports.Server = Server;
 module.exports.Message = Message;
+module.exports.EncryptedMessage = EncryptedMessage;
+module.exports.SignedMessage = SignedMessage;
 module.exports.TorContext = TorContext;
 module.exports.ScalingBloomFilter = ScalingBloomFilter;
 module.exports.Node = Node;

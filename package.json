@@ -4,7 +4,7 @@
     "email": "161chihuahuas@disroot.org"
   },
   "bin": {
-    "fishdb": "bin/damselfish.js"
+    "ddb": "bin/damselfish.js"
   },
   "bugs": {
     "url": "https://github.com/161chihuahuas/damselfish/issues"
@@ -25,7 +25,7 @@
     "jsonschema": "^1.5.0",
     "ora": "^8.2.0"
   },
-  "description": "replicated anonymous databases for privacy-preserving apps",
+  "description": "distributed anonymous metadata storage & encryption layer for indexing significant hashes",
   "directories": {
     "test": "test",
     "lib": "lib",

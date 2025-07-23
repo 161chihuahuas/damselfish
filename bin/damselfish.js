@@ -5,6 +5,7 @@
 const { EventEmitter } = require('node:events');
 const { fork } = require('node:child_process');
 const { readFile } = require('node:fs/promises');
+const { inspect } = require('node:util');
 
 const clc = require('cli-color');
 const Spinner = require('ora').default;
@@ -69,12 +70,13 @@ const {
   Link,
   Collection,
   Client,
-  Identity } = require('../index');
+  Identity,
+  SignedMessage } = require('../index');
 
 const program = new Command();
 
 program
-  .name(clc.bold('fishdb'))
+  .name(clc.bold('ddb'))
   .description(clc.italic(require('../package.json').description))
   .version(require('../package.json').version)
   .addHelpText('beforeAll', titleArt);  
@@ -223,7 +225,8 @@ async function shell(query, options) {
     }).start();
   }
 
-  const { search, password, Separator } = await import('@inquirer/prompts');
+  const { input, search, password, Separator } = 
+    await import('@inquirer/prompts');
 
   let _pass = options.unlock || '';
 
@@ -277,10 +280,39 @@ async function shell(query, options) {
       text: 'Welcome to the FishQL shell. ' +
         `Type ${clc.bold('help')} or ${clc.bold('?')} to get started <3`
     });
-    _shell();
+
+    client.invoke('_challenge', [], (err, results) => {
+      if (err) {
+        return _err(err);
+      }
+
+      let msg = new SignedMessage(results[0].head.solution, results[0].body, 
+        results[0].head);
+      const { challenge: decryptedChallenge } = msg
+        .decrypt(identity.secret.privateKey).unwrap();
+
+      client.invoke('_login', [decryptedChallenge], (err) => {
+        if (err) {
+          return _err(err);
+        }
+
+        _shell();
+      });
+    })
   }
 
-  const _done = (err, results) => {
+  function _formatResults(method, results) {
+    const output = [];
+
+    switch (method) {
+      default:
+        output.push(results);
+    }
+    
+    return inspect(output, false, null, true);
+  }
+
+  const _done = (err, results, method) => {
     if (err) {
       if (query) {
         process.stderr.write(JSON.stringify(err) + '\n');
@@ -296,7 +328,7 @@ async function shell(query, options) {
       } else {
         _loader.stopAndPersist({
           symbol: theme.prefix.result,
-          text: JSON.stringify(results)
+          text: _formatResults(method, results)
         });
       }
     }
@@ -309,11 +341,11 @@ async function shell(query, options) {
   }
 
   async function _shell() {
-    let input;
+    let _input;
      
     function _getMethods() {
       return new Promise((resolve, reject) => {
-        client.invoke('__spec', [], (err, _methods) => {
+        client.invoke('help', [], (err, _methods) => {
           if (err) {
             reject(err);
           } else { 
@@ -323,17 +355,13 @@ async function shell(query, options) {
       });
     }
 
+    let params = [];
+
     try {
-      input = query || await search({
+      _input = query || await search({
         message: '~ $ ',
-        source: async (input, { signal }) => {
+        source: async (_input, { signal }) => {
           const methods = [
-            {
-              name: 'help',
-              value: { method: 'help', params: [] },
-              description: 'Show usage information.',
-              short: 'help()'
-            },
             {
               name: 'exit',
               value: { method: 'exit', params: [] },
@@ -342,30 +370,39 @@ async function shell(query, options) {
             }
           ].concat(await _getMethods()).filter(m => m.name[0] !== '_');
 
-          return input 
-            ? methods.filter(m => m.name.includes(input))
+          return _input 
+            ? methods.filter(m => m.name.includes(_input))
             : methods;
         },
-        pageSize: 6,
-        theme
+        pageSize: 5,
+        theme,
+        validate(_input) {
+          return true;
+        }
       });
     } catch (e) {
       return _err(e);
     }
 
-    switch (input.method) {
-      case 'help':
-        program.outputHelp();
-        _shell();
-        break;
+    switch (_input.method) {
       case 'exit':
         _close();
         break;
+      case 'clusteradd':
+      case 'clusterdel':
+        params.push(await input({
+          message: 'Name for replicated collection:',
+          default: 'default',
+          prefill: 'tab',
+          required: true,
+          theme
+        }))
       default:
         _loader && _loader.start(); 
-        let q = input.method;
-        console.log(input)
-        client.invoke(input.method, [], _done);
+        let q = _input.method;
+        client.invoke(_input.method, params, (err, results) => {
+          _done(err, results, _input.method);
+        });
     }
   }
 
