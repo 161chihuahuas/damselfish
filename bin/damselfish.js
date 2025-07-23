@@ -302,14 +302,7 @@ async function shell(query, options) {
   }
 
   function _formatResults(method, results) {
-    const output = [];
-
-    switch (method) {
-      default:
-        output.push(results);
-    }
-    
-    return inspect(output, false, null, true);
+    return inspect(results, false, null, true);
   }
 
   const _done = (err, results, method) => {
@@ -341,7 +334,7 @@ async function shell(query, options) {
   }
 
   async function _shell() {
-    let _input;
+    let _input, params = [];
      
     function _getMethods() {
       return new Promise((resolve, reject) => {
@@ -354,8 +347,6 @@ async function shell(query, options) {
         });
       });
     }
-
-    let params = [];
 
     try {
       _input = query || await search({
@@ -374,7 +365,7 @@ async function shell(query, options) {
             ? methods.filter(m => m.name.includes(_input))
             : methods;
         },
-        pageSize: 5,
+        pageSize: 9,
         theme,
         validate(_input) {
           return true;
@@ -388,18 +379,20 @@ async function shell(query, options) {
       case 'exit':
         _close();
         break;
-      case 'clusteradd':
-      case 'clusterdel':
-        params.push(await input({
-          message: 'Name for replicated collection:',
-          default: 'default',
-          prefill: 'tab',
-          required: true,
-          theme
-        }))
       default:
+        console.log(_input)
+        for (let p = 0; p < _input.params.length; p++) {
+          let [_name, _default] = _input.params[p].split('=').map(s => s.trim())
+          _default = _default.replace(/["'"]+/g, '');
+          params.push(await input({
+            message: _name,
+            required: true,
+            theme,
+            default: _default
+          }));
+        }
+
         _loader && _loader.start(); 
-        let q = _input.method;
         client.invoke(_input.method, params, (err, results) => {
           _done(err, results, _input.method);
         });

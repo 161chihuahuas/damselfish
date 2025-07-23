@@ -975,71 +975,8 @@ class Presence extends EventEmitter {
    *
    */
   createControllerInterface() {
-    const p = this;
-
-    async function peeradd(link, respond) {
-      let result;
-      try {
-        result = await p.addContact(link);
-      } catch (e) {
-        return respond(e);
-      }
-
-      respond(null, result);
-    }
-
-    peeradd.description = 'Add a host to the routing table and initiate lookup.';
-    peeradd.short = 'peeradd()';
-      
-    async function peerdel(fingerprint, respond) {
-      let result;
-      try {
-        result = await p.removeContact(fingerprint);
-      } catch (e) {
-        return respond(e);
-      }
-
-      respond(null, result);
-    }
-
-    peerdel.description = 'Drop the host fingerprint from the routing table.';
-    peerdel.short = 'peerdel()';
-
-    async function clusteradd(name, respond) {
-      let result;
-      try {
-        result = await p.createCluster([], name);
-      } catch (e) {
-        return respond(e);
-      }
-      respond(null, result);
-    }
-
-    clusteradd.description = 'Create a new replicated collection.';
-    clusteradd.short = 'clusteradd()';
-
-    async function clusterdel(name, respond) {
-      let result;
-      try {
-        result = await p.destroyCluster(name);
-      } catch (e) {
-        return respond(e);
-      }
-      respond(null, result);
-    }
-
-    clusterdel.description = 'Delete and unsubscribe from a replicated collection.';
-    clusterdel.short = 'clusterdel()';
-
-    async function statedump(respond) {
-      respond(null, p);
-    }
-
-    statedump.description = 'Get the current state of the database.';
-    statedump.short = 'statedump()';
-
-    const apiFactory = (localkey = 'default', queryStr, respond) => {
-      return async function query(queryStr, respond) {
+    const apiFactory = (localkey = 'default', query, respond) => {
+      const _query = async (query = '$filter', respond) => {
         const collection = this.collections.get(localkey);
 
         if (!collection) {
@@ -1047,27 +984,27 @@ class Presence extends EventEmitter {
         }
 
         let result = null;
-        const token = queryStr.substring(0, 1);
+        const token = query.substring(0, 1);
 
         switch (token) {
           case '$':
             try {
-              result = await collection.get(queryStr.substring(1));
+              result = await collection.get(query.substring(1));
             } catch (e) {
               return respond(e);
             }
             break;
           case '~':
             try {
-              result = await collection.tail(queryStr.substring(1));
+              result = await collection.tail(query.substring(1));
             } catch (e) {
               return respond(e);
             }
             break;
           case '+':
-            const [blob, index] = queryStr.substring(1).split('/');
+            const [blob, index] = query.substring(1).split('/');
             try {
-              result = await collection.put(Buffer.from(blob, 'hex'), json 
+              result = await collection.put(Buffer.from(blob, 'hex'), index 
                 ? JSON.parse(index)
                 : {});
             } catch (e) {
@@ -1076,13 +1013,13 @@ class Presence extends EventEmitter {
             break;
           case '-':
             try {
-              result = await collection.tombstone(queryStr.substring(1));
+              result = await collection.tombstone(query.substring(1));
             } catch (e) {
               return respond(e);
             }
             break;
           case '^':
-            const [exp, patch] = queryStr.substring(1).split('/');
+            const [exp, patch] = query.substring(1).split('/');
             try {
               result = await collection.patch(exp, patch 
                 ? JSON.parse(patch)
@@ -1093,8 +1030,8 @@ class Presence extends EventEmitter {
             break;
           case '%':
             try {
-              let schema = queryStr.substring(1)
-                ? JSON.parse(queryStr.substring(1))
+              let schema = query.substring(1)
+                ? JSON.parse(query.substring(1))
                 : null;
 
               if (schema) {
@@ -1116,25 +1053,65 @@ class Presence extends EventEmitter {
             return respond(new Error('Invalid token "' + token + '"'));
         }
 
-        respond(null, [result])
+        respond(null, result);
       };
+
+      return _query;
     };
 
     const api = {
-      statedump,
-      peeradd,
-      peerdel,
-      clusteradd,
-      clusterdel
+      'peer.link': async (link = 'damselfish://', respond) => {
+        try {
+          respond(null, await this.addContact(link));
+        } catch (e) {
+          return respond(e);
+        }
+      },
+      'peer.unlink': async (fingerprint = randomBytes(20).toString('hex'), respond) => {
+        try {
+          respond(null, await this.removeContact(fingerprint));
+        } catch (e) {
+          respond(e);
+        }
+      },
+      'cluster.create': async (name = 'default', respond) => {
+        try {
+          respond(null, await this.createCluster([], name));
+          _update();
+        } catch (e) {
+          respond(e);
+        }
+      },
+      'cluster.destroy': async (name = 'default', respond) => {
+        try {
+          respond(null, await this.destroyCluster(name));
+          _update();
+        } catch (e) {
+          respond(e);
+        }
+      }
     };
-    
-    for (let [key, collection] of this.collections.entries()) {
-      api[`@${key}`] = (queryStr, respond) => {
-        return apiFactory(key).call(this, queryStr, respond);
-      };
-      api[`@${key}`].description = `Query the cluster named "${key}".`;
-      api[`@${key}`].short = `@${key}()`;
-    }
+
+    api['peer.link'].description = 'Connect to another damselfish.';
+    api['peer.link'].short = 'peer.link()';
+    api['peer.unlink'].description = 'Disconnect from a peer.';
+    api['peer.unlink'].short = 'peer.unlink()';
+    api['cluster.create'].description = 'Create a new replicated index.';
+    api['cluster.create'].short = 'cluster.create()';
+    api['cluster.destroy'].description = 'Destroy a replicated index.';
+    api['cluster.destroy'].short = 'cluster.destroy()';
+
+    const _update = () => {
+      Object.keys(api).forEach(k => k[0] === '@' && delete api[k]);
+
+      for (let [key, collection] of this.collections.entries()) {
+        api[`@${key}`] = apiFactory(key);
+        api[`@${key}`].description = `Query the cluster named "${key}".`;
+        api[`@${key}`].short = `@${key}()`;
+      }
+    };
+
+    _update();
 
     return api;
   }
@@ -1155,7 +1132,7 @@ class Presence extends EventEmitter {
     function _parseMethodSignature(name) {
       const method = name;
       const func = controlServer.api[method].toString();
-      const args = func.split(`async function ${method}(`)[1].split(')')[0];
+      const args = func.split(`async (`)[1].split(')')[0];
       const params = args.split(', ').map(s => s.trim());
       const { description, short } = controlServer.api[method];
 
@@ -1170,17 +1147,18 @@ class Presence extends EventEmitter {
       };
     }
 
-    async function help(callback) {
-      if (arguments.length > 1) {
-        return arguments[arguments.length - 1](new Error('Invalid params'));
-      }
-      callback(null, Object.getOwnPropertyNames(controlServer.api).filter(method => {
+    const help = async (respond) => {
+      controlServer.api = { 
+        ...controlServer.api,
+        ...this.createControllerInterface()
+      };
+      respond(null, Object.getOwnPropertyNames(controlServer.api).filter(method => {
           return method[0] !== '_' && method !== 'constructor' &&
             typeof controlServer.api[method] === 'function';
         })
         .map(_parseMethodSignature)
         .sort((a, b) => b.method < a.method));
-    }
+    };
 
     help.description = 'Show API specification.';
     help.short = 'help()';
@@ -1194,7 +1172,7 @@ class Presence extends EventEmitter {
 
     let didRegister = typeof clientPublicKey !== 'undefined';
 
-    async function _link(token, _clientPublicKey, respond) {
+    const _link = async (token, _clientPublicKey, respond) => {
       if (token === clientToken.toString('hex')) {
         didRegister = true;
         controlServer.api.register = null;
@@ -1211,12 +1189,12 @@ class Presence extends EventEmitter {
       } else {
         respond(new Error('Unauthorized.'));
       }
-    }
+    };
 
     _link.description = 'Register a new controller client given the server token and pubkey.';
     _link.short = '_link()';
 
-    async function _challenge(respond) {
+    const _challenge = async (respond) => {
       respond(null, [identity.message(clientPublicKey, {
         challenge: clientChallenge.toString('hex')
       })]);
@@ -1225,7 +1203,7 @@ class Presence extends EventEmitter {
     _challenge.description = 'Request a challenge to decrypt to prove key ownership.';
     _challenge.short = '_challenge()';
 
-    async function _login(decryptedChallenge, respond) {
+    const _login = async (decryptedChallenge, respond) => {
       if (decryptedChallenge !== clientChallenge.toString('hex')) {
         return respond(new Error('Unauthorized.'));
       }
@@ -1233,7 +1211,7 @@ class Presence extends EventEmitter {
       controlServer.api = { _login, _challenge, help, ...controllerApi };
 
       respond(null, Object.keys(controlServer.api));
-    }
+    };
 
     _login.description = 'Establish an authenticated control channel.';
     _login.short = '_login()';
@@ -1378,12 +1356,12 @@ class Collection {
    */
   get(exp) {
     return new Promise(async (resolve, reject) => {
-      const { jsonquery } = await import('@jsonquerylang/jsonquery').default;
-      
+      const jsonquery = await import('@jsonquerylang/jsonquery');
+      const $ = jsonquery.jsonquery;
       let results;
 
       try {
-        results = jsonquery(this.data, exp).map(async meta => 
+        results = $(this.data, exp).map(async meta => 
           await this.presence.readGraph(meta.graph));
       } catch (e) {
         return reject(e);
