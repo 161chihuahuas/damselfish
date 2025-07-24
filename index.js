@@ -23,7 +23,7 @@ const { Client, Server } = require('@yipsec/scarf');
 const { Identity, Message, SignedMessage, EncryptedMessage } = require('@yipsec/rise');
 const { TorContext } = require('@yipsec/bulb');
 const { ScalingBloomFilter } = require('@yipsec/blossom').bloom;
-const { Node, Contact, constants } = require('@yipsec/kdns');
+const { Node, Contact, constants, keys } = require('@yipsec/kdns');
 const { consensus, events, log } = require('@yipsec/brig');
 const { dag, tree } = require('@yipsec/merked');
 const { MerkleTree } = require('@yipsec/merked/lib/tree');
@@ -715,7 +715,7 @@ class Presence extends EventEmitter {
       const merkleGraph = dag.DAG.fromBuffer(
           buffer,
           4 * 1024, // slice size in bytes
-          tree.MerkleTree.DEFAULT_HASH_FUNC, // hash function to use on inputs
+          keys.hash160, // hash function to use on inputs
           false, // pad the last slice to the slice size
           false // if padLastSlice fill with random bytes?
       );
@@ -1060,21 +1060,14 @@ class Presence extends EventEmitter {
     };
 
     const api = {
-      'peer.link': async (link = 'damselfish://', respond) => {
+      'link': async (link = 'damselfish://', respond) => {
         try {
           respond(null, await this.addContact(link));
         } catch (e) {
           return respond(e);
         }
       },
-      'peer.unlink': async (fingerprint = randomBytes(20).toString('hex'), respond) => {
-        try {
-          respond(null, await this.removeContact(fingerprint));
-        } catch (e) {
-          respond(e);
-        }
-      },
-      'cluster.create': async (name = 'default', respond) => {
+      'index': async (name = 'default', respond) => {
         try {
           respond(null, await this.createCluster([], name));
           _update();
@@ -1082,7 +1075,7 @@ class Presence extends EventEmitter {
           respond(e);
         }
       },
-      'cluster.destroy': async (name = 'default', respond) => {
+      'drop': async (name = 'default', respond) => {
         try {
           respond(null, await this.destroyCluster(name));
           _update();
@@ -1092,14 +1085,12 @@ class Presence extends EventEmitter {
       }
     };
 
-    api['peer.link'].description = 'Connect to another damselfish.';
-    api['peer.link'].short = 'peer.link()';
-    api['peer.unlink'].description = 'Disconnect from a peer.';
-    api['peer.unlink'].short = 'peer.unlink()';
-    api['cluster.create'].description = 'Create a new replicated index.';
-    api['cluster.create'].short = 'cluster.create()';
-    api['cluster.destroy'].description = 'Destroy a replicated index.';
-    api['cluster.destroy'].short = 'cluster.destroy()';
+    api.link.description = 'Connect to another damselfish.';
+    api.link.short = 'link()';
+    api.index.description = 'Create a new replicated index.';
+    api.index.short = 'index()';
+    api.drop.description = 'Destroy a replicated index.';
+    api.drop.short = 'drop()';
 
     const _update = () => {
       Object.keys(api).forEach(k => k[0] === '@' && delete api[k]);
@@ -1134,7 +1125,7 @@ class Presence extends EventEmitter {
       const func = controlServer.api[method].toString();
       const args = func.split(`async (`)[1].split(')')[0];
       const params = args.split(', ').map(s => s.trim());
-      const { description, short } = controlServer.api[method];
+      const { disabled, description, short } = controlServer.api[method];
 
       params.pop();
 
@@ -1143,7 +1134,7 @@ class Presence extends EventEmitter {
         value: { method, params },
         description,
         short,
-        disabled: false
+        disabled
       };
     }
 
@@ -1172,11 +1163,11 @@ class Presence extends EventEmitter {
 
     let didRegister = typeof clientPublicKey !== 'undefined';
 
-    const _link = async (token, _clientPublicKey, respond) => {
+    const register = async (token, _clientPublicKey, respond) => {
       if (token === clientToken.toString('hex')) {
         didRegister = true;
-        controlServer.api.register = null;
-        controlServer.api = { _challenge, _link };
+        controlServer.api.register.disabled = true;
+        controlServer.api = { challenge, register };
 
         clients.add(_clientPublicKey);
         emit(Presence.Events.ClientRegistered, {
@@ -1191,34 +1182,33 @@ class Presence extends EventEmitter {
       }
     };
 
-    _link.description = 'Register a new controller client given the server token and pubkey.';
-    _link.short = '_link()';
+    register.description = 'Register a new controller client given the server token and pubkey.';
+    register.short = 'register()';
 
-    const _challenge = async (respond) => {
+    const challenge = async (respond) => {
       respond(null, [identity.message(clientPublicKey, {
         challenge: clientChallenge.toString('hex')
       })]);
     };
 
-    _challenge.description = 'Request a challenge to decrypt to prove key ownership.';
-    _challenge.short = '_challenge()';
+    challenge.description = 'Request a challenge to decrypt to prove key ownership.';
+    challenge.short = 'challenge()';
 
-    const _login = async (decryptedChallenge, respond) => {
-      if (decryptedChallenge !== clientChallenge.toString('hex')) {
+    const login = async (token = '', respond) => {
+      if (token !== clientChallenge.toString('hex')) {
         return respond(new Error('Unauthorized.'));
       }
 
-      controlServer.api = { _login, _challenge, help, ...controllerApi };
-
-      respond(null, Object.keys(controlServer.api));
+      controlServer.api = { login, challenge, help, ...controllerApi };
+      help(respond);
     };
 
-    _login.description = 'Establish an authenticated control channel.';
-    _login.short = '_login()';
+    login.description = 'Establish an authenticated control channel.';
+    login.short = 'login()';
 
     controlServer.api = didRegister
-      ? { _login, _challenge, help }
-      : { _link, help };
+      ? { login, challenge, help }
+      : { register, help };
 
     return new Promise(async (resolve, reject) => {
       let address;
@@ -1554,3 +1544,4 @@ module.exports.Log = log.Log;
 module.exports.LogState = log.LogState;
 module.exports.Graph = dag.DAG;
 module.exports.constants = constants;
+module.exports.keys = keys;

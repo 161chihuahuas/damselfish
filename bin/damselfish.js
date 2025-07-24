@@ -281,7 +281,7 @@ async function shell(query, options) {
         `Type ${clc.bold('help')} or ${clc.bold('?')} to get started <3`
     });
 
-    client.invoke('_challenge', [], (err, results) => {
+    client.invoke('challenge', [], (err, results) => {
       if (err) {
         return _err(err);
       }
@@ -291,7 +291,7 @@ async function shell(query, options) {
       const { challenge: decryptedChallenge } = msg
         .decrypt(identity.secret.privateKey).unwrap();
 
-      client.invoke('_login', [decryptedChallenge], (err) => {
+      client.invoke('login', [decryptedChallenge], (err) => {
         if (err) {
           return _err(err);
         }
@@ -316,6 +316,19 @@ async function shell(query, options) {
         });
       }
     } else {
+      switch (method) {
+        case 'challenge':
+          let msg = new SignedMessage(results[0].head.solution, results[0].body, 
+            results[0].head);
+          results[0].body = {
+            challenge: results[0].body,
+            token: msg.decrypt(identity.secret.privateKey).unwrap().challenge
+          };
+          break;
+        default:
+          // noop
+      }
+
       if (query) {
         process.stdout.write(JSON.stringify(results) + '\n');
       } else {
@@ -380,16 +393,19 @@ async function shell(query, options) {
         _close();
         break;
       default:
-        console.log(_input)
         for (let p = 0; p < _input.params.length; p++) {
           let [_name, _default] = _input.params[p].split('=').map(s => s.trim())
           _default = _default.replace(/["'"]+/g, '');
-          params.push(await input({
-            message: _name,
-            required: true,
-            theme,
-            default: _default
-          }));
+          try {
+            params.push(await input({
+              message: _name + ' =',
+              required: true,
+              theme,
+              default: _default
+            }));
+          } catch (e) {
+            return _err(e);
+          }
         }
 
         _loader && _loader.start(); 
