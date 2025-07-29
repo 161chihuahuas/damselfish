@@ -259,7 +259,7 @@ async function shell(query, options) {
       symbol: theme.prefix.error,
       text: e.message
     });
-    query && process.stderr.write(JSON.stringify(e));
+    query && process.stderr.write(e.message + '\n');
     client.stream.destroy();
     process.exit(1);
   }
@@ -281,7 +281,7 @@ async function shell(query, options) {
         `Type ${clc.bold('help')} or ${clc.bold('?')} to get started <3`
     });
 
-    client.invoke('challenge', [], (err, results) => {
+    client.invoke('knock', [], (err, results) => {
       if (err) {
         return _err(err);
       }
@@ -317,12 +317,12 @@ async function shell(query, options) {
       }
     } else {
       switch (method) {
-        case 'challenge':
+        case 'knock':
           let msg = new SignedMessage(results[0].head.solution, results[0].body, 
             results[0].head);
-          results[0].body = {
-            challenge: results[0].body,
-            token: msg.decrypt(identity.secret.privateKey).unwrap().challenge
+
+          results[0] = {
+            challenge: msg.decrypt(identity.secret.privateKey).unwrap().challenge
           };
           break;
         default:
@@ -361,8 +361,16 @@ async function shell(query, options) {
       });
     }
 
+    if (query) {
+      let [method, ...params] = query.split(' ');
+      _input = {
+        method,
+        params
+      };
+    }
+    
     try {
-      _input = query || await search({
+      _input = _input || await search({
         message: '~ $ ',
         source: async (_input, { signal }) => {
           const methods = [
@@ -397,7 +405,7 @@ async function shell(query, options) {
           let [_name, _default] = _input.params[p].split('=').map(s => s.trim())
           _default = _default.replace(/["'"]+/g, '');
           try {
-            params.push(await input({
+            params.push(query ? _default : await input({
               message: _name + ' =',
               required: true,
               theme,

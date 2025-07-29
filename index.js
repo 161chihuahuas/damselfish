@@ -796,6 +796,35 @@ class Presence extends EventEmitter {
   } 
 
   /**
+   *
+   *
+   *
+   */
+  _toPeerObject(fingerprint) {
+    const _deliverMsg = (id, msg) => {
+      let client = this.peers.get(id);
+      const contact = this.dht.router.getContactById(id);
+
+      if (!client) {
+        client = new Client();
+
+        client.stream.on('connect', () => {
+          this.peers.set(id, client);
+          client.invoke(msg.constructor.method, [msg]);
+        }).on('error', (err) => {
+          this.peers.delete(id);
+        });
+
+        client.connect(contact.address.port);
+      } else {
+        client.invoke(msg.constructor.method, [msg]);
+      }
+    };
+
+    return new consensus.Peer(fingerprint, _deliverMsg);
+  }
+
+  /**
    * Creates and negotiates a new cluster. A cluster is a shared log containing 
    * commands that rebuild a shared media timeline state machine. This 
    * abstraction may be surfaced as a personal journal, a public blog, a group 
@@ -810,32 +839,10 @@ class Presence extends EventEmitter {
       );
     }
 
-    return new Promise(async (resolve, reject) => {
+    return new Promise(async (resolve, reject) => { 
       // The peer list in the configuration is converted into a list of Peer 
       // objects.
-      const peers = members.map(fingerprint => {
-        return new consensus.Peer(fingerprint, _deliverMsg);
-      });
-
-      const _deliverMsg = (id, msg) => {
-        let client = this.peers.get(id);
-        const contact = this.dht.router.getContactById(id);
-
-        if (!client) {
-          client = new Client();
-
-          client.stream.on('connect', () => {
-            this.peers.set(id, client);
-            client.invoke(msg.constructor.method, [msg]);
-          }).on('error', (err) => {
-            this.peers.delete(id);
-          });
-
-          client.connect(contact.address.port);
-        } else {
-          client.invoke(msg.constructor.method, [msg]);
-        }
-      };
+      const peers = members.map(this._toPeerObject);
 
       // Create a getapiial key to store cluster config locally.
       localkey = localkey || randomUUID();
@@ -975,7 +982,7 @@ class Presence extends EventEmitter {
    *
    */
   createControllerInterface() {
-    const apiFactory = (localkey = 'default', query, respond) => {
+    const apiFactory = (localkey = 'default') => {
       const _query = async (query = '$filter', respond) => {
         const collection = this.collections.get(localkey);
 
@@ -984,7 +991,7 @@ class Presence extends EventEmitter {
         }
 
         let result = null;
-        const token = query.substring(0, 1);
+        const token = query ? query.substring(0, 1) : null;
 
         switch (token) {
           case '$':
@@ -1044,10 +1051,15 @@ class Presence extends EventEmitter {
             }
             break;
           case '&':
-            // TODO addPeer
+            let fpAdd = query.substring(1);
+            result = collection.cluster.addPeer(this._toPeerObject(fpAdd));
             break;
           case '!':
-            // TODO removePeer
+            let fpDel = query.substring(1);
+            result = collection.cluster.removePeer(this._toPeerObject(fpDel));
+            break;
+          case '?':
+            result = collection;
             break;
           default:
             return respond(new Error('Invalid token "' + token + '"'));
@@ -1117,9 +1129,10 @@ class Presence extends EventEmitter {
     const { identity, clients, emit } = this;
     const controllerApi = this.createControllerInterface();
     const clientToken = randomBytes(32);
-    const clientChallenge = randomBytes(64);
     const controlServer = new Server({}, createServer);
 
+    let clientChallenge = randomBytes(64);
+    
     function _parseMethodSignature(name) {
       const method = name;
       const func = controlServer.api[method].toString();
@@ -1161,17 +1174,16 @@ class Presence extends EventEmitter {
     process.on('uncaughtException', () => controlServer.server.close());
     process.on('unhandledRejection', () => controlServer.server.close());
 
-    let didRegister = typeof clientPublicKey !== 'undefined';
+    let didRegister = !!clientPublicKey;
 
-    const register = async (token, _clientPublicKey, respond) => {
+    const register = async (token = '', clientPublicKey = '', respond) => {
       if (token === clientToken.toString('hex')) {
         didRegister = true;
-        controlServer.api.register.disabled = true;
-        controlServer.api = { challenge, register };
+        controlServer.api = { knock, login };
 
-        clients.add(_clientPublicKey);
+        clients.add(clientPublicKey);
         emit(Presence.Events.ClientRegistered, {
-          clientPublicKey: _clientPublicKey,
+          clientPublicKey,
           clientToken,
           clientChallenge,
           serverAddress
@@ -1185,21 +1197,22 @@ class Presence extends EventEmitter {
     register.description = 'Register a new controller client given the server token and pubkey.';
     register.short = 'register()';
 
-    const challenge = async (respond) => {
+    const knock = async (respond) => {
+      clientChallenge = randomBytes(64);
       respond(null, [identity.message(clientPublicKey, {
         challenge: clientChallenge.toString('hex')
       })]);
     };
 
-    challenge.description = 'Request a challenge to decrypt to prove key ownership.';
-    challenge.short = 'challenge()';
+    knock.description = 'Request a challenge to decrypt to prove key ownership.';
+    knock.short = 'knock()';
 
     const login = async (token = '', respond) => {
       if (token !== clientChallenge.toString('hex')) {
         return respond(new Error('Unauthorized.'));
       }
 
-      controlServer.api = { login, challenge, help, ...controllerApi };
+      controlServer.api = { login, knock, help, ...controllerApi };
       help(respond);
     };
 
@@ -1207,7 +1220,7 @@ class Presence extends EventEmitter {
     login.short = 'login()';
 
     controlServer.api = didRegister
-      ? { login, challenge, help }
+      ? { login, knock, help }
       : { register, help };
 
     return new Promise(async (resolve, reject) => {
