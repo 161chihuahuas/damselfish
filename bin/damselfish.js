@@ -82,6 +82,69 @@ program
   .addHelpText('beforeAll', titleArt);  
 
 program
+  .command('keygen')
+  .description('generate a new identity bundle')
+  .option('-l, --lock [password]', 'encrypt the bundle using the supplied password', '')
+  .option('-i, --interactive', 'prompt for user input')
+  .option('--raw', 'output raw bytes to stdio for piping to other programs')
+  .option('--easy', 'use a lowered difficulty setting (!warning!)')
+  .action(keygen);
+
+async function keygen(options) {
+  const loading = options.raw ? null : Spinner({ 
+    text: `Generating a new identity key bundle...`,
+    spinner,
+    discardStdin: false
+  });
+
+  process.on('uncaughtException', e => {
+    loading.stopAndPersist({
+      text: e.message,
+      symbol: theme.prefix.error
+    })
+  });
+  
+  const { password } = await import('@inquirer/prompts');
+
+  let _pass = options.lock || '';
+
+  if (_pass === true && options.interactive) {
+    _pass = await password({ 
+      message: 'Enter passphrase for new identity bundle:',
+      mask: true,
+      theme
+    });
+  } 
+
+  loading.start();
+
+  let bundle;
+
+  try {
+    if (options.easy) {
+      bundle = await Identity.generate(Identity.TEST_Z, Identity.TEST_N, 
+        Identity.TEST_K, Identity.TEST_MAGIC);
+    } else {
+      bundle = await Identity.generate();
+    }
+  } catch (e) {
+    if (options.raw) {
+      return process.stderr.write(e.message);
+    }
+    return loading.fail(e.message);
+  }
+
+  if (!options.raw) {
+    loading.succeed(inspect([
+      bundle.toJSON(), 
+      bundle.lock(_pass).toString('base64') 
+    ], false, null, true));
+  } else {
+    process.stdout.write(bundle.lock(_pass));
+  }
+}
+
+program
   .command('open')
   .description('load or create a database')
   .argument('[directory]', 'path to database directory', Config.DataDirectory)
@@ -322,7 +385,7 @@ async function shell(query, options) {
             results[0].head);
 
           results[0] = {
-            challenge: msg.decrypt(identity.secret.privateKey).unwrap().challenge
+            token: msg.decrypt(identity.secret.privateKey).unwrap().challenge
           };
           break;
         default:

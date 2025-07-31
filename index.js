@@ -83,8 +83,8 @@ class Storage {
       blob  = Buffer.from(blob, 'hex');
 
       const info = JSON.stringify(meta);
-      const blobInfoPath = join(this.root, key + '.info');
-      const blobDataPath = join(this.root, key + '.part');
+      const blobInfoPath = join(this.root, hash + '.info');
+      const blobDataPath = join(this.root, hash + '.part');
 
       try {
         await writeFile(blobDataPath, blob);
@@ -92,6 +92,8 @@ class Storage {
       } catch (err) {
         return reject(err);
       }
+    
+      resolve(meta);
     });
   }
 
@@ -719,18 +721,34 @@ class Presence extends EventEmitter {
           false, // pad the last slice to the slice size
           false // if padLastSlice fill with random bytes?
       );
+      const response = { results: [], errors: [] };
 
       // For every shard in the DAG, store it by its hash.
       for (let s = 0; s < merkleGraph.shards.length; s++) {
         try {
-          await this.dht.iterativeStore(merkleGraph.leaves[s], 
-            merkleGraph.shards[s]);
-        } catch (err) {
-          return reject(err);
+          response.results.push(
+            await this.storage.put(merkleGraph.leaves[s].toString('hex'), {
+              blob: buffer.toString('hex'),
+              meta: {
+                timestamp: Date.now(),
+                publisher: this.identity.fingerprint.toString('hex')
+              }
+            })
+          );
+        } catch (e) {
+          response.errors.push({ error: e.message });
+        }
+        try {
+          response.results.push(
+            await this.dht.iterativeStore(merkleGraph.leaves[s].toString('hex'), 
+              merkleGraph.shards[s]));
+        } catch (e) {
+          response.errors.push({ error: e.message });
         }
       }
 
-      resolve(merkleGraph.toMetadata(aliasName));
+      response.graph = merkleGraph.toMetadata(aliasName);
+      resolve(response);
     });
   }
 
@@ -743,27 +761,43 @@ class Presence extends EventEmitter {
   readGraph(graphMeta) {
     return new Promise(async (resolve, reject) => {
       try {
-        // Collect the results of parallel blob lookups and concatenate them.
-        resolve(dag.DAG.fromBuffer(Buffer.concat(
-          await Promise.all(graphMeta.l.map(leaf => {
-            return new Promise(async (resolve, reject) => {
-              if (this.storage.has(leaf)) {
-                try {
-                  resolve(await this.storage.get(leaf).blob);
-                  return;
-                } catch (err) {
-                  // noop
-                }
-              }
+        if (typeof graphMeta === 'string') {
+          graphMeta = JSON.parse(graphMeta);
+        }
 
+        const blobResolvers = graphMeta.l.map(leaf => {
+          return new Promise(async (resolve, reject) => {
+            if (this.storage.has(leaf)) {
               try {
-                resolve(await this.dht.iterativeFindValue(leaf));
+                resolve((await this.storage.get(leaf)).blob);
+                return;
               } catch (err) {
-                return reject(err);
+                // noop
               }
-            });
-          }))
-        )));
+            }
+
+            try {
+              resolve(await this.dht.iterativeFindValue(leaf));
+            } catch (err) {
+              return reject(err);
+            }
+          });
+        });
+
+        const buffers = (await Promise.all(blobResolvers))
+          .map(blob => Buffer.from(blob, 'hex'));
+        const buffer = Buffer.concat(buffers);
+        
+        // Collect the results of parallel blob lookups and concatenate them.
+        const tree = dag.DAG.fromBuffer(
+          buffer, 
+          4 * 1024,
+          keys.hash160,
+          false,
+          false
+        );
+
+        resolve({ graph: JSON.parse(tree.toMetadata()), trace: buffer.toString('hex') });
       } catch (err) {
         return reject(err);
       }
@@ -1094,6 +1128,20 @@ class Presence extends EventEmitter {
         } catch (e) {
           respond(e);
         }
+      },
+      'graph': async (hex = '00f12acabf1200', alias = 'blob.fish', respond) => {
+        try {
+          respond(null, await this.writeGraph(Buffer.from(hex, 'hex'), alias)); 
+        } catch (e) {
+          respond(e);
+        }
+      },
+      'trace': async (graph = '{"l":[]}', respond) => {
+        try {
+          respond(null, await this.readGraph(JSON.parse(graph)));
+        } catch (e) {
+          respond(e);
+        }
       }
     };
 
@@ -1401,7 +1449,7 @@ class Collection {
 
       try {
         graph = await this.presence.writeGraph(buffer, 
-          `/${this.presence.identity.fingerprint}/${this.hash}.fish`);
+          `/${this.presence.identity.fingerprint}/${hash}.fish`);
       } catch (e) {
         return reject(e);
       }
