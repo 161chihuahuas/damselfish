@@ -330,6 +330,15 @@ class Presence extends EventEmitter {
     this._bootstrap();
   }
 
+  toJSON() {
+    return {
+      contact: this.contact,
+      collections: this.collections,
+      clients: this.clients,
+      peers: this.peers
+    };
+  }
+
   /**
    * Asynchronously create a damselfish presense.
    *
@@ -1115,7 +1124,12 @@ class Presence extends EventEmitter {
       },
       'index': async (name = 'default', respond) => {
         try {
-          respond(null, await this.createCluster([], name));
+          let cluster = await this.createCluster([], name);
+          respond(null, { 
+            id: cluster.id, 
+            state: cluster.state.serialize().toString('base64'), 
+            peers: cluster.peers 
+          });
           _update();
         } catch (e) {
           respond(e);
@@ -1142,6 +1156,9 @@ class Presence extends EventEmitter {
         } catch (e) {
           respond(e);
         }
+      }, 
+      'info': async (respond) => {
+        respond(null, this.toJSON());
       }
     };
 
@@ -1342,6 +1359,18 @@ class Collection {
     this.presence = presence;
   }
 
+  toJSON() {
+    return {
+      cluster: {
+        id: this.cluster.id,
+        peers: this.cluster.peers,
+        state: this.cluster.state.serialize().toString('base64')
+      },
+      shortname: this.shortname,
+      schema: this.schema
+    };
+  }
+
   validate(jsonSchema) {
     if (!jsonSchema) {
       this.schema = null;
@@ -1454,7 +1483,13 @@ class Collection {
         return reject(e);
       }
 
-      let entries = [];
+      let entries = [
+        this.presence.identity.message(
+          this.presence.identity.secret.publicKey,
+          { graph, index },
+          { op: 'put' }
+        )
+      ];
 
       try {
         for (let p = 0; p < this.cluster.peers.length; p++) {

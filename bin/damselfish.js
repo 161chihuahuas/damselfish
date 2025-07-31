@@ -436,7 +436,7 @@ async function shell(query, options) {
       _input = _input || await search({
         message: '~ $ ',
         source: async (_input, { signal }) => {
-          const methods = [
+          let methods = [
             {
               name: 'exit',
               value: { method: 'exit', params: [] },
@@ -444,6 +444,11 @@ async function shell(query, options) {
               short: 'exit()'
             }
           ].concat(await _getMethods()).filter(m => m.name[0] !== '_');
+
+          methods = methods.sort((a, b) => {
+            return b.name > a.name
+              ? -1 : 1;
+          });
 
           return _input 
             ? methods.filter(m => m.name.includes(_input))
