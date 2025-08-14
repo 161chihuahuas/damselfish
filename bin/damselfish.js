@@ -71,7 +71,8 @@ const {
   Collection,
   Client,
   Identity,
-  SignedMessage } = require('../index');
+  SignedMessage, 
+  SystemdUnit} = require('../index');
 
 const program = new Command();
 
@@ -98,10 +99,10 @@ async function keygen(options) {
   });
 
   process.on('uncaughtException', e => {
-    loading.stopAndPersist({
+    loading && loading.stopAndPersist({
       text: e.message,
       symbol: theme.prefix.error
-    })
+    }) || console.error(e);
   });
   
   const { password } = await import('@inquirer/prompts');
@@ -116,7 +117,7 @@ async function keygen(options) {
     });
   } 
 
-  loading.start();
+  loading && loading.start();
 
   let bundle;
 
@@ -496,6 +497,65 @@ async function shell(query, options) {
     .on('connect', _connect)
     .on('close', _close)
     .on('error', _err);
+}
+
+program
+  .command('service')
+  .description('manage background service (linux/systemd)')
+  .option('--status', 'alias for "systemctl status damselfish"')
+  .option('--install', 'creates a systemd unit and installs it')
+  .option('--remove', 'removes the systemd unit')
+  .option('--start', 'alias for "systemctl start damselfish"')
+  .option('--stop', 'alias for "systemctl stop damselfish"')
+  .option('--restart', 'alias for "systemctl restart damselfish"')
+  .option('--enable', 'alias for "systemctl enable damselfish"')
+  .option('--disable', 'alias for "systemctl disable damselfish"')
+  .action(service);
+
+async function service(options) {
+  const unit = new SystemdUnit();
+
+  if (Object.keys(options).length !== 1) {
+    return this.help();
+  }
+
+  try {
+    if (options.status) {
+      return console.log(unit.status().toString());
+    }
+
+    if (options.install) {
+      return console.log(unit.install().toString());
+    }
+
+    if (options.remove) {
+      return console.log(unit.remove().toString());
+    }
+
+    if (options.start) {
+      return console.log(unit.start().toString());
+    }
+
+    if (options.stop) {
+      return console.log(unit.stop().toString());
+    }
+
+    if (options.restart) {
+      return console.log(unit.restart().toString());
+    }
+
+    if (options.enable) {
+      return console.log(unit.enable().toString());
+    }
+
+    if (options.disable) {
+      return console.log(unit.disable().toString());
+    }
+  } catch (e) {
+    return console.error(e.stdout.toString()); // noop
+  }
+
+  this.help();
 }
 
 program.parse();

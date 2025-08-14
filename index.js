@@ -7,12 +7,12 @@
 
 'use strict';
 
-const { homedir } = require('node:os');
+const { homedir, tmpdir } = require('node:os');
 const { join, extname } = require('node:path');
 const { randomBytes, randomUUID } = require('node:crypto');
 const { URL } = require('node:url');
 const { stringify } = require('node:querystring');
-const { statSync, existsSync, mkdirSync, readdirSync } = require('node:fs');
+const { statSync, existsSync, mkdirSync, readdirSync, unlink, writeFileSync } = require('node:fs');
 const { readFile, writeFile } = require('node:fs/promises');
 const { EventEmitter } = require('node:events');
 const { Readable } = require('node:stream');
@@ -24,9 +24,11 @@ const { Identity, Message, SignedMessage, EncryptedMessage } = require('@yipsec/
 const { TorContext } = require('@yipsec/bulb');
 const { ScalingBloomFilter } = require('@yipsec/blossom').bloom;
 const { Node, Contact, constants, keys } = require('@yipsec/kdns');
-const { consensus, events, log } = require('@yipsec/brig');
+const { consensus, events, log, roles } = require('@yipsec/brig');
 const { dag, tree } = require('@yipsec/merked');
 const { MerkleTree } = require('@yipsec/merked/lib/tree');
+const { execSync } = require('node:child_process');
+const { hash256 } = require('@yipsec/kdns/lib/keys');
 
 
 class Storage {
@@ -216,7 +218,10 @@ class Config {
       OnionKeyPath: join(datadir, 'address_key.encrypted'),
       LinkedClients: join(datadir, 'linked_clients.encrypted'),
       RoutingTable: join(datadir, 'routing_table.encrypted'),
-      ControlSocket: join(datadir, 'control.sock')
+      ControlSocket: {
+        host: '127.0.0.1',
+        port: 2222
+      }
     };
   }
 
@@ -939,6 +944,11 @@ class Presence extends EventEmitter {
 
       this.clusters.set(cluster.id, cluster);
       this.collections.set(localkey, new Collection(cluster, this, localkey));
+      
+      if (members.length === 0) {
+        cluster.state.setCurrentRole(roles.Leader);
+      }
+
       resolve(cluster);
     });
   }
@@ -1168,6 +1178,13 @@ class Presence extends EventEmitter {
     api.index.short = 'index()';
     api.drop.description = 'Destroy a replicated index.';
     api.drop.short = 'drop()';
+    api.graph.description = 'Create a graph from a binary blob.';
+    api.graph.short = 'graph()';
+    api.trace.description = 'Trace a graph back to a binary blob.';
+    api.trace.short = 'trace()';
+    api.info.description = 'Get database and network information.';
+    api.info.short = 'info()';
+
 
     const _update = () => {
       Object.keys(api).forEach(k => k[0] === '@' && delete api[k]);
@@ -1299,11 +1316,7 @@ class Presence extends EventEmitter {
       };
 
       try {
-        if (typeof serverOpts === 'string') {
-          controlServer.listen(serverOpts, _done);
-        } else {
-          address = await controlServer.server.listen(serverOpts);
-        }
+        controlServer.listen(serverOpts, _done);
       } catch (e) {
         return reject(e);
       }
@@ -1620,6 +1633,133 @@ class Collection {
 
 module.exports.Collection = Collection;
 
+
+class SystemdUnit {
+
+  /**
+   *
+   *
+   * @constructor
+   */
+  constructor() {
+    this.fileContents = Buffer.from(SystemdUnit.Template, 'utf8');
+    this.writePath = '/lib/systemd/system/damselfish.service';
+  }
+
+  /**
+   *
+   *
+   */
+  static get Template() {
+    return `
+[Unit]
+Description=damselfish - ${require('./package').description}
+Documentation=https://yipsec.io/damselfish
+After=network.target
+
+[Service]
+Environment=
+Type=simple
+User=${require('node:os').userInfo().username}
+ExecStart=${process.execPath} ${join(__dirname, 'bin/damselfish.js')} open
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+    `;
+  }
+
+  /**
+   *
+   *
+   */
+  install() {
+    let tmp = join(tmpdir(), hash256(this.fileContents).toString('hex'));
+
+    writeFileSync(tmp, this.fileContents);
+
+    return this._pkexec(`mv ${tmp} ${this.writePath}`)
+      && this._pkexec('systemctl daemon-reload');
+  }
+
+  /**
+   *
+   *
+   */
+  remove() {
+    return this._pkexec(`rm ${this.writePath}`)
+      && this.reload();
+  }
+
+  /**
+   *
+   *
+   */
+  start() {
+    return execSync('systemctl start damselfish');
+  }
+
+  /**
+   *
+   *
+   */
+  restart() {
+    return execSync('systemctl restart damselfish');
+  }
+  
+  /**
+   *
+   *
+   */
+  stop() {
+    return execSync('systemctl stop damselfish');
+  }
+
+  /**
+   *
+   *
+   */
+  reload() {
+    return this._pkexec('systemctl daemon-reload');
+  }
+
+  /**
+   *
+   *
+   */
+  status() {
+    return execSync('systemctl status damselfish');
+  }
+
+  /**
+   *
+   *
+   */
+  enable() {
+    return execSync('systemctl enable damselfish');
+  }
+
+  /**
+   *
+   *
+   */
+  disable() {
+    return execSync('systemctl disable damselfish');
+  }
+
+  /**
+   *
+   *
+   */
+  _pkexec(cmd) {
+    return execSync(`pkexec ${cmd}`);
+  }
+
+}
+
+module.exports.SystemdUnit = SystemdUnit;
+
+// Also export submodules
 module.exports.Identity = Identity;
 module.exports.Client = Client;
 module.exports.Validator = Validator;
@@ -1635,6 +1775,7 @@ module.exports.MerkleTree = MerkleTree;
 module.exports.Peer = consensus.Peer;
 module.exports.Cluster = consensus.Cluster;
 module.exports.Cluster.Events = events;
+module.exports.Cluster.Roles = roles;
 module.exports.LogEntry = log.LogEntry;
 module.exports.Log = log.Log;
 module.exports.LogState = log.LogState;
